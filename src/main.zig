@@ -7,6 +7,7 @@ const output = @import("output.zig");
 const matcher = @import("matcher.zig");
 
 pub const ColorMode = enum { auto, always, never };
+pub const HeadingMode = enum { auto, always, never };
 
 pub const Config = struct {
     pattern: []const u8,
@@ -20,6 +21,7 @@ pub const Config = struct {
     max_depth: ?usize = null,
     num_threads: ?usize = null,
     color: ColorMode = .auto,
+    heading: HeadingMode = .auto,
 
     pub fn getNumThreads(self: Config) usize {
         return self.num_threads orelse (std.Thread.getCpuCount() catch 4);
@@ -103,6 +105,10 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                         return error.InvalidArgument;
                     }
                 }
+            } else if (std.mem.eql(u8, arg, "--heading")) {
+                config.heading = .always;
+            } else if (std.mem.eql(u8, arg, "--no-heading")) {
+                config.heading = .never;
             } else {
                 std.debug.print("Unknown option: {s}\n", .{arg});
                 return error.InvalidArgument;
@@ -155,6 +161,8 @@ fn printHelp() void {
         \\    -j, --threads NUM       Number of threads to use
         \\    -d, --max-depth NUM     Maximum directory depth to search
         \\    --color MODE            Color mode: auto, always, never (default: auto)
+        \\    --heading               Group matches by file with headers (default for TTY)
+        \\    --no-heading            Print file:line:content format (default for pipes)
         \\
         \\EXAMPLES:
         \\    zrep "TODO" src/

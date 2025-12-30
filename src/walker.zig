@@ -149,7 +149,7 @@ pub const Walker = struct {
         }
 
         // Use per-file buffer to batch output - reduces mutex contention
-        var file_buf = output.FileBuffer.init(alloc, self.config, self.out.colorEnabled());
+        var file_buf = output.FileBuffer.init(alloc, self.config, self.out.colorEnabled(), self.out.headingEnabled());
         defer file_buf.deinit();
 
         var line_iter = reader.LineIterator.init(data);
