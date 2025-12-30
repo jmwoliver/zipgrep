@@ -29,9 +29,11 @@ pub const Config = struct {
 };
 
 pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // Use page allocator backing an arena for fast bulk allocations
+    // Arena is much faster than GeneralPurposeAllocator for our use case
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     const config = parseArgs(allocator) catch |err| {
         if (err == error.HelpRequested) {
@@ -166,7 +168,8 @@ fn printHelp() void {
 }
 
 fn run(allocator: std.mem.Allocator, config: Config) !void {
-    defer allocator.free(config.paths);
+    // With arena allocator, no need to free individual allocations
+    // The arena handles bulk deallocation at the end
     
     const stdout = std.fs.File.stdout();
 

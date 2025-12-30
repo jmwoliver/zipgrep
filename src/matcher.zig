@@ -56,6 +56,15 @@ pub const Matcher = struct {
             return self.findLiteral(haystack);
         } else {
             if (self.regex_engine) |*re| {
+                // Use literal prefix for SIMD pre-filtering if available
+                // This quickly rejects lines that can't possibly match
+                if (re.getLiteralPrefix()) |prefix| {
+                    // Fast path: check if prefix exists using SIMD
+                    if (simd.findSubstring(haystack, prefix) == null) {
+                        return null; // No prefix = no match possible
+                    }
+                }
+                // Full regex match
                 return re.find(haystack);
             }
             return null;

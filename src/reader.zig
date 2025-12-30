@@ -86,6 +86,9 @@ fn mmapFile(file: std.fs.File, size: u64) ?FileContent {
         0,
     ) catch return null;
 
+    // Hint to kernel that we'll read sequentially - improves prefetching
+    std.posix.madvise(ptr.ptr, @intCast(size), std.posix.MADV.SEQUENTIAL) catch {};
+
     return FileContent{ .mmap = .{
         .data = ptr[0..@intCast(size)],
     } };

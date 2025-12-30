@@ -1,6 +1,10 @@
 const std = @import("std");
 const matcher_mod = @import("matcher.zig");
 
+/// Maximum number of NFA states supported (256 states = 32 bytes bitset)
+/// This is enough for most practical regex patterns
+const MAX_STATES: usize = 256;
+
 /// A state in the NFA
 const State = struct {
     /// Transition type
@@ -53,18 +57,154 @@ const CharClass = struct {
     }
 };
 
+/// Fixed-size bitset for tracking NFA states - no allocations during matching
+const StateBitset = struct {
+    bits: [MAX_STATES / 64]u64,
+
+    pub fn init() StateBitset {
+        return .{ .bits = [_]u64{0} ** (MAX_STATES / 64) };
+    }
+
+    pub fn clear(self: *StateBitset) void {
+        @memset(&self.bits, 0);
+    }
+
+    pub fn set(self: *StateBitset, idx: usize) void {
+        if (idx >= MAX_STATES) return;
+        self.bits[idx / 64] |= @as(u64, 1) << @intCast(idx % 64);
+    }
+
+    pub fn isSet(self: *const StateBitset, idx: usize) bool {
+        if (idx >= MAX_STATES) return false;
+        return (self.bits[idx / 64] & (@as(u64, 1) << @intCast(idx % 64))) != 0;
+    }
+
+    pub fn isEmpty(self: *const StateBitset) bool {
+        for (self.bits) |word| {
+            if (word != 0) return false;
+        }
+        return true;
+    }
+
+    /// Iterate over set bits
+    pub fn iterator(self: *const StateBitset) Iterator {
+        return .{ .bitset = self, .word_idx = 0, .bit_idx = 0 };
+    }
+
+    const Iterator = struct {
+        bitset: *const StateBitset,
+        word_idx: usize,
+        bit_idx: u6,
+
+        pub fn next(self: *Iterator) ?usize {
+            while (self.word_idx < MAX_STATES / 64) {
+                var word = self.bitset.bits[self.word_idx];
+                // Skip already processed bits
+                word &= ~((@as(u64, 1) << self.bit_idx) - 1);
+
+                if (word != 0) {
+                    const bit_pos = @ctz(word);
+                    const result = self.word_idx * 64 + bit_pos;
+                    // Advance to next position
+                    if (bit_pos < 63) {
+                        self.bit_idx = @intCast(bit_pos + 1);
+                    } else {
+                        self.word_idx += 1;
+                        self.bit_idx = 0;
+                    }
+                    return result;
+                }
+                self.word_idx += 1;
+                self.bit_idx = 0;
+            }
+            return null;
+        }
+    };
+};
+
 pub const Regex = struct {
     allocator: std.mem.Allocator,
     states: std.ArrayListUnmanaged(State),
     start: usize,
+    match_state: usize, // Cache the match state index for fast checking
+    literal_prefix: ?[]const u8, // Extracted literal prefix for SIMD pre-filtering
+    pattern_storage: ?[]u8, // Storage for the pattern (for prefix extraction)
 
     pub fn compile(allocator: std.mem.Allocator, pattern: []const u8) CompileError!Regex {
         var compiler = Compiler.init(allocator);
-        return compiler.compile(pattern);
+        var re = try compiler.compile(pattern);
+
+        // Extract literal prefix for SIMD pre-filtering
+        re.literal_prefix = extractLiteralPrefix(pattern);
+
+        // Store the pattern if we have a prefix
+        if (re.literal_prefix != null) {
+            re.pattern_storage = try allocator.dupe(u8, pattern);
+            // Update prefix to point to our owned copy
+            re.literal_prefix = re.pattern_storage.?[0..re.literal_prefix.?.len];
+        }
+
+        return re;
+    }
+
+    /// Extract the literal prefix from a regex pattern (before any metacharacters)
+    /// Returns null if no useful literal prefix exists
+    fn extractLiteralPrefix(pattern: []const u8) ?[]const u8 {
+        if (pattern.len == 0) return null;
+
+        var end: usize = 0;
+        var i: usize = 0;
+
+        while (i < pattern.len) : (i += 1) {
+            const c = pattern[i];
+            switch (c) {
+                // Metacharacters that end literal prefix
+                '.', '*', '+', '?', '[', ']', '(', ')', '{', '}', '|', '^', '$' => break,
+                '\\' => {
+                    // Escaped character - could be literal or special
+                    if (i + 1 < pattern.len) {
+                        const escaped = pattern[i + 1];
+                        switch (escaped) {
+                            // These are special regex escapes, not literal
+                            'd', 'D', 'w', 'W', 's', 'S', 'b', 'B' => break,
+                            // These are literal characters
+                            'n', 'r', 't' => {
+                                // Can't use these in SIMD prefix search easily
+                                break;
+                            },
+                            else => {
+                                // Escaped metacharacter or regular char - skip both
+                                i += 1;
+                                end = i + 1;
+                            },
+                        }
+                    } else {
+                        break;
+                    }
+                },
+                else => {
+                    end = i + 1;
+                },
+            }
+        }
+
+        // Need at least 2 characters for useful prefix
+        if (end >= 2) {
+            return pattern[0..end];
+        }
+        return null;
+    }
+
+    /// Get the literal prefix for SIMD pre-filtering
+    pub fn getLiteralPrefix(self: *const Regex) ?[]const u8 {
+        return self.literal_prefix;
     }
 
     pub fn deinit(self: *Regex) void {
         self.states.deinit(self.allocator);
+        if (self.pattern_storage) |ps| {
+            self.allocator.free(ps);
+        }
     }
 
     /// Find the first match in the input
@@ -82,20 +222,18 @@ pub const Regex = struct {
         return null;
     }
 
-    /// Check if there's a match at the given position
+    /// Check if there's a match at the given position - uses bitsets, no allocations
     fn matchAt(self: *const Regex, input: []const u8, start: usize) ?usize {
-        var current_states = std.AutoHashMapUnmanaged(usize, void){};
-        defer current_states.deinit(self.allocator);
-        var next_states = std.AutoHashMapUnmanaged(usize, void){};
-        defer next_states.deinit(self.allocator);
+        var current_states = StateBitset.init();
+        var next_states = StateBitset.init();
 
         // Add start state and follow epsilon transitions
-        self.addState(&current_states, self.start) catch return null;
+        self.addStateWithEpsilon(&current_states, self.start);
 
         var longest_match: ?usize = null;
 
         // Check if start state is already a match
-        if (self.checkMatch(&current_states)) {
+        if (current_states.isSet(self.match_state)) {
             longest_match = start;
         }
 
@@ -104,31 +242,27 @@ pub const Regex = struct {
             const c = input[pos];
 
             // Process all current states
-            var iter = current_states.keyIterator();
-            while (iter.next()) |state_ptr| {
-                const state = self.states.items[state_ptr.*];
+            var iter = current_states.iterator();
+            while (iter.next()) |state_idx| {
+                const state = self.states.items[state_idx];
                 if (self.matchTransition(state.transition, c)) {
-                    if (state.out1) |next| {
-                        self.addState(&next_states, next) catch continue;
+                    if (state.out1) |next_state| {
+                        self.addStateWithEpsilon(&next_states, next_state);
                     }
                 }
             }
 
             // Swap current and next
-            current_states.clearRetainingCapacity();
-            var next_iter = next_states.keyIterator();
-            while (next_iter.next()) |k| {
-                current_states.put(self.allocator, k.*, {}) catch continue;
-            }
-            next_states.clearRetainingCapacity();
+            current_states = next_states;
+            next_states.clear();
 
             // Check for match
-            if (self.checkMatch(&current_states)) {
+            if (current_states.isSet(self.match_state)) {
                 longest_match = pos + 1;
             }
 
             // If no states left, break early
-            if (current_states.count() == 0) break;
+            if (current_states.isEmpty()) break;
         }
 
         return longest_match;
@@ -144,33 +278,22 @@ pub const Regex = struct {
         };
     }
 
-    fn addState(self: *const Regex, states: *std.AutoHashMapUnmanaged(usize, void), state_idx: usize) !void {
-        if (states.contains(state_idx)) return;
+    /// Add a state and follow all epsilon transitions
+    fn addStateWithEpsilon(self: *const Regex, states: *StateBitset, state_idx: usize) void {
+        if (state_idx >= MAX_STATES or states.isSet(state_idx)) return;
 
         const state = self.states.items[state_idx];
+        states.set(state_idx);
 
-        // Follow epsilon transitions
+        // Follow epsilon transitions recursively
         if (state.transition == .epsilon) {
-            try states.put(self.allocator, state_idx, {});
             if (state.out1) |next| {
-                try self.addState(states, next);
+                self.addStateWithEpsilon(states, next);
             }
             if (state.out2) |next| {
-                try self.addState(states, next);
-            }
-        } else {
-            try states.put(self.allocator, state_idx, {});
-        }
-    }
-
-    fn checkMatch(self: *const Regex, states: *std.AutoHashMapUnmanaged(usize, void)) bool {
-        var iter = states.keyIterator();
-        while (iter.next()) |state_ptr| {
-            if (self.states.items[state_ptr.*].transition == .match) {
-                return true;
+                self.addStateWithEpsilon(states, next);
             }
         }
-        return false;
     }
 };
 
@@ -214,6 +337,9 @@ const Compiler = struct {
             .allocator = self.allocator,
             .states = self.states,
             .start = frag.start,
+            .match_state = match_state,
+            .literal_prefix = null,
+            .pattern_storage = null,
         };
     }
 
@@ -259,10 +385,10 @@ const Compiler = struct {
 
             // Handle quantifiers
             if (self.pos < self.pattern.len) {
-                const next = self.pattern[self.pos];
-                if (next == '*' or next == '+' or next == '?') {
+                const next_char = self.pattern[self.pos];
+                if (next_char == '*' or next_char == '+' or next_char == '?') {
                     self.pos += 1;
-                    atom = try self.applyQuantifier(atom, next);
+                    atom = try self.applyQuantifier(atom, next_char);
                 }
             }
 
@@ -521,4 +647,33 @@ test "regex character class" {
     try std.testing.expect(re.find("b") != null);
     try std.testing.expect(re.find("c") != null);
     try std.testing.expect(re.find("d") == null);
+}
+
+test "bitset operations" {
+    var bs = StateBitset.init();
+    try std.testing.expect(bs.isEmpty());
+
+    bs.set(0);
+    bs.set(5);
+    bs.set(63);
+    bs.set(64);
+    bs.set(100);
+
+    try std.testing.expect(!bs.isEmpty());
+    try std.testing.expect(bs.isSet(0));
+    try std.testing.expect(bs.isSet(5));
+    try std.testing.expect(bs.isSet(63));
+    try std.testing.expect(bs.isSet(64));
+    try std.testing.expect(bs.isSet(100));
+    try std.testing.expect(!bs.isSet(1));
+    try std.testing.expect(!bs.isSet(65));
+
+    // Test iterator
+    var iter = bs.iterator();
+    try std.testing.expectEqual(@as(?usize, 0), iter.next());
+    try std.testing.expectEqual(@as(?usize, 5), iter.next());
+    try std.testing.expectEqual(@as(?usize, 63), iter.next());
+    try std.testing.expectEqual(@as(?usize, 64), iter.next());
+    try std.testing.expectEqual(@as(?usize, 100), iter.next());
+    try std.testing.expectEqual(@as(?usize, null), iter.next());
 }
