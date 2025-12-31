@@ -13,52 +13,85 @@ else
 pub const Vec = @Vector(VECTOR_WIDTH, u8);
 pub const BoolVec = @Vector(VECTOR_WIDTH, bool);
 
+/// Find a single byte using SIMD
+fn findByte(haystack: []const u8, byte: u8) ?usize {
+    if (haystack.len == 0) return null;
+
+    const byte_vec: Vec = @splat(byte);
+    var pos: usize = 0;
+
+    // SIMD loop - process VECTOR_WIDTH bytes at a time
+    while (pos + VECTOR_WIDTH <= haystack.len) {
+        const chunk: Vec = haystack[pos..][0..VECTOR_WIDTH].*;
+        const cmp: BoolVec = chunk == byte_vec;
+
+        if (@reduce(.Or, cmp)) {
+            const MaskType = std.meta.Int(.unsigned, VECTOR_WIDTH);
+            const mask: MaskType = @bitCast(cmp);
+            return pos + @ctz(mask);
+        }
+        pos += VECTOR_WIDTH;
+    }
+
+    // Scalar fallback for remaining bytes
+    while (pos < haystack.len) : (pos += 1) {
+        if (haystack[pos] == byte) return pos;
+    }
+    return null;
+}
+
 /// Find a substring using SIMD-accelerated first byte search followed by memcmp
 /// This is the "quick search" approach used by many fast string matchers
 pub fn findSubstring(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len == 0) return 0;
     if (needle.len > haystack.len) return null;
+
+    // Single byte optimization: use SIMD byte search
     if (needle.len == 1) {
-        var i: usize = 0;
-        while (i < haystack.len) : (i += 1) {
-            if (haystack[i] == needle[0]) return i;
-        }
-        return null;
+        return findByte(haystack, needle[0]);
     }
 
     const first_byte = needle[0];
-    const rest = needle[1..];
+    const first_vec: Vec = @splat(first_byte);
+    const max_pos = haystack.len - needle.len;
     var pos: usize = 0;
 
-    while (pos <= haystack.len - needle.len) {
-        // Find potential match positions (first byte matches)
-        var found = false;
-        var offset: usize = 0;
-        var i: usize = 0;
-        while (i < haystack[pos..].len) : (i += 1) {
-            if (haystack[pos + i] == first_byte) {
-                offset = i;
-                found = true;
-                break;
+    // SIMD loop - process VECTOR_WIDTH bytes at a time looking for first byte
+    while (pos + VECTOR_WIDTH <= max_pos + 1) {
+        const chunk: Vec = haystack[pos..][0..VECTOR_WIDTH].*;
+        const cmp: BoolVec = chunk == first_vec;
+
+        if (@reduce(.Or, cmp)) {
+            // Found at least one first-byte match in this chunk
+            const MaskType = std.meta.Int(.unsigned, VECTOR_WIDTH);
+            var mask: MaskType = @bitCast(cmp);
+
+            // Process all matches in this chunk
+            while (mask != 0) {
+                const offset = @ctz(mask);
+                const candidate = pos + offset;
+
+                // Check if we have room for full needle
+                if (candidate <= max_pos) {
+                    // Verify full needle match
+                    if (std.mem.eql(u8, haystack[candidate..][0..needle.len], needle)) {
+                        return candidate;
+                    }
+                }
+
+                // Clear lowest set bit and check next match
+                mask &= mask - 1;
             }
         }
+        pos += VECTOR_WIDTH;
+    }
 
-        if (found) {
-            const candidate = pos + offset;
-
-            // Check if we have enough room for the full needle
-            if (candidate + needle.len > haystack.len) {
-                return null;
+    // Scalar fallback for remaining positions
+    while (pos <= max_pos) : (pos += 1) {
+        if (haystack[pos] == first_byte) {
+            if (std.mem.eql(u8, haystack[pos..][0..needle.len], needle)) {
+                return pos;
             }
-
-            // Verify the rest of the needle matches
-            if (std.mem.eql(u8, haystack[candidate + 1 ..][0..rest.len], rest)) {
-                return candidate;
-            }
-
-            pos = candidate + 1;
-        } else {
-            return null;
         }
     }
 
@@ -81,11 +114,30 @@ pub fn findSubstringFrom(haystack: []const u8, needle: []const u8, start: usize)
     return null;
 }
 
-/// Find the next newline character
+/// Find the next newline character using SIMD
 pub fn findNewline(haystack: []const u8) ?usize {
-    var i: usize = 0;
-    while (i < haystack.len) : (i += 1) {
-        if (haystack[i] == '\n') return i;
+    if (haystack.len == 0) return null;
+
+    const newline_vec: Vec = @splat('\n');
+    var pos: usize = 0;
+
+    // SIMD loop - process VECTOR_WIDTH bytes at a time
+    while (pos + VECTOR_WIDTH <= haystack.len) {
+        const chunk: Vec = haystack[pos..][0..VECTOR_WIDTH].*;
+        const cmp: BoolVec = chunk == newline_vec;
+
+        if (@reduce(.Or, cmp)) {
+            // Found at least one newline in this chunk
+            const MaskType = std.meta.Int(.unsigned, VECTOR_WIDTH);
+            const mask: MaskType = @bitCast(cmp);
+            return pos + @ctz(mask);
+        }
+        pos += VECTOR_WIDTH;
+    }
+
+    // Scalar fallback for remaining bytes
+    while (pos < haystack.len) : (pos += 1) {
+        if (haystack[pos] == '\n') return pos;
     }
     return null;
 }
