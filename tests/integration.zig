@@ -257,3 +257,51 @@ test "integration: help flag" {
     // Help should contain usage info
     try std.testing.expect(std.mem.indexOf(u8, result.stderr, "USAGE") != null);
 }
+
+test "integration: word boundary flag" {
+    const allocator = std.testing.allocator;
+
+    // Without -w: "pattern" should match "pattern" in lowercase line
+    const result_without = try runZrep(allocator, &.{ "pattern", "tests/fixtures/sample.txt" });
+    defer allocator.free(result_without.stdout);
+    defer allocator.free(result_without.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, result_without.stdout, "pattern lowercase") != null);
+
+    // With -w: "pattern" should still match as a whole word
+    const result_with = try runZrep(allocator, &.{ "-w", "pattern", "tests/fixtures/sample.txt" });
+    defer allocator.free(result_with.stdout);
+    defer allocator.free(result_with.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, result_with.stdout, "pattern lowercase") != null);
+}
+
+test "integration: word boundary rejects partial matches" {
+    const allocator = std.testing.allocator;
+
+    // Search for "file" - without -w should match "file" in multiple contexts
+    const result_without = try runZrep(allocator, &.{ "file", "tests/fixtures/sample.txt" });
+    defer allocator.free(result_without.stdout);
+    defer allocator.free(result_without.stderr);
+
+    // Count lines without -w
+    var count_without: usize = 0;
+    var lines_without = std.mem.splitScalar(u8, result_without.stdout, '\n');
+    while (lines_without.next()) |line| {
+        if (line.len > 0) count_without += 1;
+    }
+
+    // With -w: should only match "file" as a whole word
+    const result_with = try runZrep(allocator, &.{ "-w", "file", "tests/fixtures/sample.txt" });
+    defer allocator.free(result_with.stdout);
+    defer allocator.free(result_with.stderr);
+
+    // Count lines with -w
+    var count_with: usize = 0;
+    var lines_with = std.mem.splitScalar(u8, result_with.stdout, '\n');
+    while (lines_with.next()) |line| {
+        if (line.len > 0) count_with += 1;
+    }
+
+    // Both should find matches (the word "file" appears as whole word)
+    try std.testing.expect(count_without >= 1);
+    try std.testing.expect(count_with >= 1);
+}

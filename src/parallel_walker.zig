@@ -509,7 +509,7 @@ test "ParallelWalker: init and deinit" {
         .num_threads = 4,
     };
 
-    var pattern_matcher = try matcher_mod.Matcher.init(allocator, "test", false);
+    var pattern_matcher = try matcher_mod.Matcher.init(allocator, "test", false, false);
     defer pattern_matcher.deinit();
 
     const stdout = std.fs.File.stdout();
@@ -530,7 +530,7 @@ test "ParallelWalker: with gitignore matcher" {
         .paths = &[_][]const u8{"."},
     };
 
-    var pattern_matcher = try matcher_mod.Matcher.init(allocator, "test", false);
+    var pattern_matcher = try matcher_mod.Matcher.init(allocator, "test", false, false);
     defer pattern_matcher.deinit();
 
     var ignore_matcher = gitignore.GitignoreMatcher.init(allocator);

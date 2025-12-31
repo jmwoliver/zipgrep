@@ -18,6 +18,7 @@ pub const Config = struct {
     files_with_matches: bool = false,
     no_ignore: bool = false,
     hidden: bool = false,
+    word_boundary: bool = false,
     max_depth: ?usize = null,
     num_threads: ?usize = null,
     color: ColorMode = .auto,
@@ -93,6 +94,8 @@ pub fn parseArgsFromSlice(allocator: std.mem.Allocator, args: []const []const u8
                 config.no_ignore = true;
             } else if (std.mem.eql(u8, arg, "--hidden")) {
                 config.hidden = true;
+            } else if (std.mem.eql(u8, arg, "-w") or std.mem.eql(u8, arg, "--word-regexp")) {
+                config.word_boundary = true;
             } else if (std.mem.eql(u8, arg, "-j") or std.mem.eql(u8, arg, "--threads")) {
                 i += 1;
                 if (i < args.len) {
@@ -169,6 +172,7 @@ fn printHelp() void {
         \\    -n, --line-number       Show line numbers (default: on)
         \\    -c, --count             Only show count of matching lines
         \\    -l, --files-with-matches Only show filenames with matches
+        \\    -w, --word-regexp       Only match whole words
         \\    --no-ignore             Don't respect .gitignore files
         \\    --hidden                Search hidden files and directories
         \\    -j, --threads NUM       Number of threads to use
@@ -193,7 +197,7 @@ fn run(allocator: std.mem.Allocator, config: Config) !void {
     const stdout = std.fs.File.stdout();
 
     // Create the pattern matcher
-    var pattern_matcher = try matcher.Matcher.init(allocator, config.pattern, config.ignore_case);
+    var pattern_matcher = try matcher.Matcher.init(allocator, config.pattern, config.ignore_case, config.word_boundary);
     defer pattern_matcher.deinit();
 
     // Create gitignore matcher if needed
@@ -319,6 +323,26 @@ test "parseArgs --hidden flag" {
     defer allocator.free(config.paths);
 
     try std.testing.expect(config.hidden);
+}
+
+test "parseArgs -w flag" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "-w", "pattern" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expect(config.word_boundary);
+}
+
+test "parseArgs --word-regexp flag" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "--word-regexp", "pattern" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expect(config.word_boundary);
 }
 
 test "parseArgs -j threads" {
