@@ -131,12 +131,17 @@ pub const Regex = struct {
     match_state: usize, // Cache the match state index for fast checking
     literal_info: ?literal.LiteralInfo, // Extracted literal for SIMD pre-filtering
     pattern_storage: ?[]u8, // Storage for the pattern (for literal extraction)
+    starts_with_dot_star: bool, // True if pattern starts with .* (optimization for suffix filter)
 
     pub fn compile(allocator: std.mem.Allocator, pattern: []const u8) CompileError!Regex {
         var compiler = Compiler.init(allocator);
         errdefer compiler.states.deinit(allocator);
 
         var re = try compiler.compile(pattern);
+
+        // Detect if pattern starts with .* (greedy match-all)
+        // This enables optimization in findWithSuffixFilter
+        re.starts_with_dot_star = pattern.len >= 2 and pattern[0] == '.' and pattern[1] == '*';
 
         // Extract best literal for SIMD pre-filtering (prefix, suffix, or inner)
         const extracted_info = literal.extractBestLiteral(pattern);
@@ -181,19 +186,27 @@ pub const Regex = struct {
 
     /// Find the first match in the input using position-aware literal filtering
     pub fn find(self: *const Regex, input: []const u8) ?matcher_mod.MatchResult {
-        if (self.literal_info) |info| {
-            return switch (info.position) {
-                .prefix => self.findWithPrefixFilter(input, info.literal),
-                .suffix => self.findWithSuffixFilter(input, info.literal),
-                .inner => self.findWithInnerFilter(input, info),
-            };
-        }
-        return self.findBruteForce(input);
+        return self.findFrom(input, 0);
     }
 
-    /// Find using prefix literal as filter - most efficient
-    fn findWithPrefixFilter(self: *const Regex, input: []const u8, prefix: []const u8) ?matcher_mod.MatchResult {
-        var search_pos: usize = 0;
+    /// Find the first match starting from a given offset
+    /// This allows efficient resume of search after word boundary check fails
+    pub fn findFrom(self: *const Regex, input: []const u8, start_offset: usize) ?matcher_mod.MatchResult {
+        if (start_offset >= input.len) return null;
+
+        if (self.literal_info) |info| {
+            return switch (info.position) {
+                .prefix => self.findWithPrefixFilterFrom(input, info.literal, start_offset),
+                .suffix => self.findWithSuffixFilterFrom(input, info.literal, start_offset),
+                .inner => self.findWithInnerFilterFrom(input, info, start_offset),
+            };
+        }
+        return self.findBruteForceFrom(input, start_offset);
+    }
+
+    /// Find using prefix literal as filter, starting from a given offset
+    fn findWithPrefixFilterFrom(self: *const Regex, input: []const u8, prefix: []const u8, start_offset: usize) ?matcher_mod.MatchResult {
+        var search_pos: usize = start_offset;
         while (simd.findSubstringFrom(input, prefix, search_pos)) |lit_pos| {
             // Found prefix at lit_pos, try matching from there
             if (self.matchAt(input, lit_pos)) |end| {
@@ -207,21 +220,38 @@ pub const Regex = struct {
         return null;
     }
 
-    /// Find using suffix literal as filter
-    fn findWithSuffixFilter(self: *const Regex, input: []const u8, suffix: []const u8) ?matcher_mod.MatchResult {
-        var search_pos: usize = 0;
+    /// Find using suffix literal as filter, starting from a given offset
+    /// For patterns starting with .*, start_offset means "find suffix AFTER this position"
+    fn findWithSuffixFilterFrom(self: *const Regex, input: []const u8, suffix: []const u8, start_offset: usize) ?matcher_mod.MatchResult {
+        // For .* patterns, start_offset indicates we should skip suffixes before this position
+        // because they've already been tried and failed (e.g., word boundary check)
+        var search_pos: usize = start_offset;
+
         while (simd.findSubstringFrom(input, suffix, search_pos)) |lit_pos| {
-            // Found suffix at lit_pos, try matching from positions before it
-            // For patterns like .*SUFFIX, start from 0
-            var start: usize = 0;
-            while (start <= lit_pos) : (start += 1) {
-                if (self.matchAt(input, start)) |end| {
-                    // Match must include the suffix
+            if (self.starts_with_dot_star) {
+                // OPTIMIZATION: For patterns like .*SUFFIX, .* is greedy and will consume
+                // everything from the start up to the suffix. So we only try matchAt(0).
+                // This reduces O(n²) to O(n).
+                if (self.matchAt(input, 0)) |end| {
                     if (end >= lit_pos + suffix.len) {
                         return matcher_mod.MatchResult{
-                            .start = start,
+                            .start = 0,
                             .end = end,
                         };
+                    }
+                }
+            } else {
+                // For other patterns, try all positions from 0 to lit_pos
+                // (or from start_offset if resuming)
+                var start: usize = 0;
+                while (start <= lit_pos) : (start += 1) {
+                    if (self.matchAt(input, start)) |end| {
+                        if (end >= lit_pos + suffix.len) {
+                            return matcher_mod.MatchResult{
+                                .start = start,
+                                .end = end,
+                            };
+                        }
                     }
                 }
             }
@@ -230,13 +260,14 @@ pub const Regex = struct {
         return null;
     }
 
-    /// Find using inner literal as filter
-    fn findWithInnerFilter(self: *const Regex, input: []const u8, info: literal.LiteralInfo) ?matcher_mod.MatchResult {
-        var search_pos: usize = 0;
+    /// Find using inner literal as filter, starting from a given offset
+    fn findWithInnerFilterFrom(self: *const Regex, input: []const u8, info: literal.LiteralInfo, start_offset: usize) ?matcher_mod.MatchResult {
+        var search_pos: usize = start_offset;
         while (simd.findSubstringFrom(input, info.literal, search_pos)) |lit_pos| {
             // Found inner literal at lit_pos
-            // Start searching from (lit_pos - min_offset) or 0
-            const start_bound = if (lit_pos >= info.min_offset) lit_pos - info.min_offset else 0;
+            // Start searching from max(start_offset, lit_pos - min_offset)
+            const min_start = if (lit_pos >= info.min_offset) lit_pos - info.min_offset else 0;
+            const start_bound = @max(start_offset, min_start);
             var start: usize = start_bound;
             while (start <= lit_pos) : (start += 1) {
                 if (self.matchAt(input, start)) |end| {
@@ -254,9 +285,9 @@ pub const Regex = struct {
         return null;
     }
 
-    /// Brute force find - try matching at each position (fallback)
-    fn findBruteForce(self: *const Regex, input: []const u8) ?matcher_mod.MatchResult {
-        var pos: usize = 0;
+    /// Brute force find starting from a given offset (fallback when no literal filter)
+    fn findBruteForceFrom(self: *const Regex, input: []const u8, start_offset: usize) ?matcher_mod.MatchResult {
+        var pos: usize = start_offset;
         while (pos <= input.len) : (pos += 1) {
             if (self.matchAt(input, pos)) |end| {
                 return matcher_mod.MatchResult{
@@ -386,6 +417,7 @@ const Compiler = struct {
             .match_state = match_state,
             .literal_info = null,
             .pattern_storage = null,
+            .starts_with_dot_star = false, // Will be set by Regex.compile()
         };
     }
 

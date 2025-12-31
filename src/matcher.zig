@@ -61,34 +61,31 @@ pub const Matcher = struct {
     fn findFirstFrom(self: *const Matcher, haystack: []const u8, start_offset: usize) ?MatchResult {
         if (start_offset >= haystack.len) return null;
 
-        const search_slice = haystack[start_offset..];
-
         const result = if (self.is_literal)
-            self.findLiteralIn(search_slice)
+            self.findLiteralInFrom(haystack, start_offset)
         else blk: {
             if (self.regex_engine) |*re| {
-                // Regex engine handles literal filtering internally (prefix, suffix, or inner)
-                break :blk re.find(search_slice);
+                // Use findFrom to efficiently resume search from offset
+                // This avoids re-running O(n²) suffix filter on each retry
+                break :blk re.findFrom(haystack, start_offset);
             }
             break :blk null;
         };
 
         if (result) |r| {
-            // Adjust positions back to original haystack coordinates
-            const adjusted = MatchResult{
-                .start = r.start + start_offset,
-                .end = r.end + start_offset,
-            };
-
             // If word boundary mode is enabled, validate the match
             if (self.word_boundary) {
-                if (!isWordBoundaryMatch(haystack, adjusted.start, adjusted.end)) {
-                    // Not a word boundary match, try again from next position
-                    return self.findFirstFrom(haystack, adjusted.start + 1);
+                if (!isWordBoundaryMatch(haystack, r.start, r.end)) {
+                    // Not a word boundary match, try again
+                    // For patterns like .*SUFFIX where r.start is always 0,
+                    // we need to skip past the END of the match to find the next
+                    // suffix occurrence. Otherwise we'd get the same match forever.
+                    const next_pos = if (r.end > start_offset) r.end else start_offset + 1;
+                    return self.findFirstFrom(haystack, next_pos);
                 }
             }
 
-            return adjusted;
+            return r;
         }
 
         return null;
@@ -113,13 +110,13 @@ pub const Matcher = struct {
         return self.findFirst(haystack) != null;
     }
 
-    fn findLiteralIn(self: *const Matcher, haystack: []const u8) ?MatchResult {
+    fn findLiteralInFrom(self: *const Matcher, haystack: []const u8, start_offset: usize) ?MatchResult {
         if (self.ignore_case) {
-            return self.findLiteralIgnoreCase(haystack);
+            return self.findLiteralIgnoreCaseFrom(haystack, start_offset);
         }
 
         // Use SIMD-accelerated search for literal patterns
-        if (simd.findSubstring(haystack, self.pattern)) |pos| {
+        if (simd.findSubstringFrom(haystack, self.pattern, start_offset)) |pos| {
             return MatchResult{
                 .start = pos,
                 .end = pos + self.pattern.len,
@@ -128,13 +125,14 @@ pub const Matcher = struct {
         return null;
     }
 
-    fn findLiteralIgnoreCase(self: *const Matcher, haystack: []const u8) ?MatchResult {
+    fn findLiteralIgnoreCaseFrom(self: *const Matcher, haystack: []const u8, start_offset: usize) ?MatchResult {
         const lower_pat = self.lower_pattern orelse return null;
 
         // Simple case-insensitive search (could be optimized with SIMD later)
         if (haystack.len < lower_pat.len) return null;
+        if (start_offset > haystack.len - lower_pat.len) return null;
 
-        var i: usize = 0;
+        var i: usize = start_offset;
         outer: while (i <= haystack.len - lower_pat.len) : (i += 1) {
             for (lower_pat, 0..) |pc, j| {
                 const hc = std.ascii.toLower(haystack[i + j]);
