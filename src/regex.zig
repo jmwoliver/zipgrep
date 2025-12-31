@@ -132,6 +132,8 @@ pub const Regex = struct {
 
     pub fn compile(allocator: std.mem.Allocator, pattern: []const u8) CompileError!Regex {
         var compiler = Compiler.init(allocator);
+        errdefer compiler.states.deinit(allocator);
+
         var re = try compiler.compile(pattern);
 
         // Extract literal prefix for SIMD pre-filtering
@@ -376,6 +378,7 @@ const Compiler = struct {
 
     fn parseTerm(self: *Compiler) CompileError!Fragment {
         var frag: ?Fragment = null;
+        errdefer if (frag) |*f| f.out.deinit(self.allocator);
 
         while (self.pos < self.pattern.len) {
             const c = self.pattern[self.pos];
@@ -430,7 +433,8 @@ const Compiler = struct {
             },
             '(' => {
                 self.pos += 1;
-                const frag_result = try self.parseExpr();
+                var frag_result = try self.parseExpr();
+                errdefer frag_result.out.deinit(self.allocator);
                 if (self.pos >= self.pattern.len or self.pattern[self.pos] != ')') {
                     return error.UnmatchedParen;
                 }

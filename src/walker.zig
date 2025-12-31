@@ -4,6 +4,7 @@ const matcher_mod = @import("matcher.zig");
 const reader = @import("reader.zig");
 const output = @import("output.zig");
 const gitignore = @import("gitignore.zig");
+const parallel_walker = @import("parallel_walker.zig");
 
 pub const Walker = struct {
     allocator: std.mem.Allocator,
@@ -32,10 +33,32 @@ pub const Walker = struct {
         _ = self;
     }
 
-    /// Main entry point - sequential directory collection, parallel file search
-    ///                    TODO need to make directory collection parallel
+    /// Main entry point - uses parallel walker for multi-threaded traversal and search
     pub fn walk(self: *Walker) !void {
-        // Collect all files first, then search in parallel
+        const num_threads = self.config.getNumThreads();
+
+        // Use parallel walker for multi-threaded operation
+        if (num_threads > 1) {
+            var pw = try parallel_walker.ParallelWalker.init(
+                self.allocator,
+                self.config,
+                self.pattern_matcher,
+                self.ignore_matcher,
+                self.out,
+            );
+            defer pw.deinit();
+
+            try pw.walk();
+            return;
+        }
+
+        // Fall back to sequential walker for single-threaded operation
+        try self.walkSequential();
+    }
+
+    /// Sequential implementation (original behavior)
+    fn walkSequential(self: *Walker) !void {
+        // Collect all files first, then search sequentially
         var files = std.ArrayListUnmanaged([]const u8){};
         defer {
             for (files.items) |f| self.allocator.free(f);
@@ -198,7 +221,7 @@ test "walker initialization" {
     var ignore_matcher = gitignore.GitignoreMatcher.init(allocator);
     defer ignore_matcher.deinit();
 
-    const stdout = std.io.getStdOut();
+    const stdout = std.fs.File.stdout();
     var out = output.Output.init(stdout, config);
 
     var w = try Walker.init(
@@ -226,7 +249,7 @@ test "walker init without ignore matcher" {
     var pattern_matcher = try matcher_mod.Matcher.init(allocator, "test", false);
     defer pattern_matcher.deinit();
 
-    const stdout = std.io.getStdOut();
+    const stdout = std.fs.File.stdout();
     var out = output.Output.init(stdout, config);
 
     var w = try Walker.init(
@@ -252,7 +275,7 @@ test "walker deinit does not crash" {
     var pattern_matcher = try matcher_mod.Matcher.init(allocator, "test", false);
     defer pattern_matcher.deinit();
 
-    const stdout = std.io.getStdOut();
+    const stdout = std.fs.File.stdout();
     var out = output.Output.init(stdout, config);
 
     var w = try Walker.init(

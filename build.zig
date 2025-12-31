@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run zrep");
     run_step.dependOn(&run_cmd.step);
 
-    // Unit tests
+    // Unit tests for main module
     const exe_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
@@ -39,6 +39,46 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    // Deque tests (includes multi-threaded stress tests)
+    const deque_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/deque.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_deque_tests = b.addRunArtifact(deque_tests);
+    const deque_test_step = b.step("test-deque", "Run deque unit and stress tests");
+    deque_test_step.dependOn(&run_deque_tests.step);
+
+    // Add deque tests to main test step as well
+    test_step.dependOn(&run_deque_tests.step);
+
+    // Gitignore tests (includes GitignoreState tests)
+    const gitignore_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gitignore.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_gitignore_tests = b.addRunArtifact(gitignore_tests);
+    test_step.dependOn(&run_gitignore_tests.step);
+
+    // Parallel walker tests
+    const parallel_walker_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/parallel_walker.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_parallel_walker_tests = b.addRunArtifact(parallel_walker_tests);
+    test_step.dependOn(&run_parallel_walker_tests.step);
 
     // Integration tests
     const integration_tests = b.addTest(.{

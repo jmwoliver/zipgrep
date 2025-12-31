@@ -344,6 +344,212 @@ pub const GitignoreMatcher = struct {
 
         return false;
     }
+
+    /// Get current number of patterns (for state tracking)
+    pub fn patternCount(self: *const GitignoreMatcher) usize {
+        return self.patterns.items.len;
+    }
+};
+
+/// Thread-local gitignore state that can be cheaply cloned.
+/// Used by parallel workers to have their own copy of gitignore patterns
+/// that can be extended with local patterns without affecting other threads.
+pub const GitignoreState = struct {
+    /// Reference to the shared base patterns (immutable, not owned)
+    base: ?*const GitignoreMatcher,
+
+    /// Additional local patterns specific to this state (owned)
+    local_patterns: std.ArrayListUnmanaged(Pattern),
+    local_pattern_storage: std.ArrayListUnmanaged([]u8),
+    local_root_storage: std.ArrayListUnmanaged([]u8),
+
+    /// Allocator for local patterns
+    allocator: std.mem.Allocator,
+
+    /// Create a new state with optional base patterns
+    pub fn init(allocator: std.mem.Allocator, base: ?*const GitignoreMatcher) GitignoreState {
+        return .{
+            .base = base,
+            .local_patterns = .{},
+            .local_pattern_storage = .{},
+            .local_root_storage = .{},
+            .allocator = allocator,
+        };
+    }
+
+    /// Create a shallow clone of this state.
+    /// The clone shares the base reference but has its own empty local patterns.
+    /// This is cheap - O(1) - since local patterns start empty.
+    pub fn clone(self: *const GitignoreState) GitignoreState {
+        return .{
+            .base = self.base,
+            .local_patterns = .{},
+            .local_pattern_storage = .{},
+            .local_root_storage = .{},
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Create a deep clone that copies local patterns as well.
+    /// Use when you need to preserve local patterns in the clone.
+    pub fn deepClone(self: *const GitignoreState) !GitignoreState {
+        var new_state = GitignoreState{
+            .base = self.base,
+            .local_patterns = .{},
+            .local_pattern_storage = .{},
+            .local_root_storage = .{},
+            .allocator = self.allocator,
+        };
+
+        // Copy all local patterns
+        for (self.local_patterns.items) |pattern| {
+            const stored_pattern = try self.allocator.dupe(u8, pattern.pattern);
+            errdefer self.allocator.free(stored_pattern);
+
+            const stored_root = try self.allocator.dupe(u8, pattern.root);
+            errdefer self.allocator.free(stored_root);
+
+            try new_state.local_pattern_storage.append(self.allocator, stored_pattern);
+            try new_state.local_root_storage.append(self.allocator, stored_root);
+
+            try new_state.local_patterns.append(self.allocator, .{
+                .pattern = stored_pattern,
+                .root = stored_root,
+                .negated = pattern.negated,
+                .directory_only = pattern.directory_only,
+                .anchored = pattern.anchored,
+                .contains_slash = pattern.contains_slash,
+            });
+        }
+
+        return new_state;
+    }
+
+    pub fn deinit(self: *GitignoreState) void {
+        for (self.local_pattern_storage.items) |stored| {
+            self.allocator.free(stored);
+        }
+        self.local_pattern_storage.deinit(self.allocator);
+
+        for (self.local_root_storage.items) |stored| {
+            self.allocator.free(stored);
+        }
+        self.local_root_storage.deinit(self.allocator);
+
+        self.local_patterns.deinit(self.allocator);
+    }
+
+    /// Add a local pattern to this state
+    pub fn addPattern(self: *GitignoreState, line: []const u8, root_dir: []const u8) !void {
+        var pattern_text = std.mem.trim(u8, line, " \t\r");
+
+        // Skip empty lines and comments
+        if (pattern_text.len == 0 or pattern_text[0] == '#') return;
+
+        var negated = false;
+        var directory_only = false;
+        var anchored = false;
+
+        // Check for negation
+        if (pattern_text[0] == '!') {
+            negated = true;
+            pattern_text = pattern_text[1..];
+        }
+
+        // Check for anchoring (starts with /)
+        if (pattern_text.len > 0 and pattern_text[0] == '/') {
+            anchored = true;
+            pattern_text = pattern_text[1..];
+        }
+
+        // Check for directory-only (ends with /)
+        if (pattern_text.len > 0 and pattern_text[pattern_text.len - 1] == '/') {
+            directory_only = true;
+            pattern_text = pattern_text[0 .. pattern_text.len - 1];
+        }
+
+        if (pattern_text.len == 0) return;
+
+        // Check if pattern contains a slash
+        const contains_slash = patternContainsSlash(pattern_text);
+
+        // Store pattern string
+        const stored_pattern = try self.allocator.dupe(u8, pattern_text);
+        errdefer self.allocator.free(stored_pattern);
+        try self.local_pattern_storage.append(self.allocator, stored_pattern);
+
+        // Store root directory
+        const stored_root = try self.allocator.dupe(u8, root_dir);
+        errdefer self.allocator.free(stored_root);
+        try self.local_root_storage.append(self.allocator, stored_root);
+
+        try self.local_patterns.append(self.allocator, .{
+            .pattern = stored_pattern,
+            .root = stored_root,
+            .negated = negated,
+            .directory_only = directory_only,
+            .anchored = anchored,
+            .contains_slash = contains_slash,
+        });
+    }
+
+    /// Load patterns from a gitignore file
+    pub fn loadFile(self: *GitignoreState, path: []const u8, root_dir: []const u8) !void {
+        const file = std.fs.cwd().openFile(path, .{}) catch return;
+        defer file.close();
+
+        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        defer self.allocator.free(content);
+
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |line| {
+            try self.addPattern(line, root_dir);
+        }
+    }
+
+    /// Check if a path should be ignored
+    pub fn isIgnored(self: *const GitignoreState, path: []const u8, is_dir: bool) bool {
+        var ignored = false;
+
+        // Check base patterns first
+        if (self.base) |base| {
+            for (base.patterns.items) |*pattern| {
+                if (pattern.matches(path, is_dir)) {
+                    ignored = !pattern.negated;
+                }
+            }
+        }
+
+        // Then check local patterns (can override base patterns)
+        for (self.local_patterns.items) |*pattern| {
+            if (pattern.matches(path, is_dir)) {
+                ignored = !pattern.negated;
+            }
+        }
+
+        return ignored;
+    }
+
+    /// Check if a file should be ignored
+    pub fn isIgnoredFile(self: *const GitignoreState, path: []const u8) bool {
+        return self.isIgnored(path, false);
+    }
+
+    /// Check if a directory should be ignored
+    pub fn isIgnoredDir(self: *const GitignoreState, path: []const u8) bool {
+        return self.isIgnored(path, true);
+    }
+
+    /// Get total number of patterns (base + local)
+    pub fn patternCount(self: *const GitignoreState) usize {
+        const base_count = if (self.base) |b| b.patterns.items.len else 0;
+        return base_count + self.local_patterns.items.len;
+    }
+
+    /// Get number of local patterns only
+    pub fn localPatternCount(self: *const GitignoreState) usize {
+        return self.local_patterns.items.len;
+    }
 };
 
 // Tests
@@ -582,4 +788,151 @@ test "patternContainsSlash" {
     // Leading/trailing slashes don't count
     try std.testing.expect(!patternContainsSlash("/build"));
     try std.testing.expect(!patternContainsSlash("build/"));
+}
+
+// GitignoreState tests
+
+test "GitignoreState: init with no base" {
+    const allocator = std.testing.allocator;
+
+    var state = GitignoreState.init(allocator, null);
+    defer state.deinit();
+
+    try std.testing.expect(state.base == null);
+    try std.testing.expectEqual(@as(usize, 0), state.patternCount());
+    try std.testing.expectEqual(@as(usize, 0), state.localPatternCount());
+}
+
+test "GitignoreState: init with base" {
+    const allocator = std.testing.allocator;
+
+    var matcher = GitignoreMatcher.init(allocator);
+    defer matcher.deinit();
+
+    try matcher.addPattern("*.log", ".");
+
+    var state = GitignoreState.init(allocator, &matcher);
+    defer state.deinit();
+
+    try std.testing.expect(state.base != null);
+    try std.testing.expectEqual(@as(usize, 1), state.patternCount());
+    try std.testing.expectEqual(@as(usize, 0), state.localPatternCount());
+
+    // Should respect base patterns
+    try std.testing.expect(state.isIgnoredFile("debug.log"));
+    try std.testing.expect(!state.isIgnoredFile("main.zig"));
+}
+
+test "GitignoreState: add local patterns" {
+    const allocator = std.testing.allocator;
+
+    var matcher = GitignoreMatcher.init(allocator);
+    defer matcher.deinit();
+
+    try matcher.addPattern("*.log", ".");
+
+    var state = GitignoreState.init(allocator, &matcher);
+    defer state.deinit();
+
+    // Add local pattern
+    try state.addPattern("*.tmp", "subdir");
+
+    try std.testing.expectEqual(@as(usize, 2), state.patternCount());
+    try std.testing.expectEqual(@as(usize, 1), state.localPatternCount());
+
+    // Base pattern still works
+    try std.testing.expect(state.isIgnoredFile("debug.log"));
+
+    // Local pattern works in scope
+    try std.testing.expect(state.isIgnoredFile("subdir/file.tmp"));
+    try std.testing.expect(!state.isIgnoredFile("file.tmp")); // Outside scope
+}
+
+test "GitignoreState: clone is shallow" {
+    const allocator = std.testing.allocator;
+
+    var matcher = GitignoreMatcher.init(allocator);
+    defer matcher.deinit();
+
+    try matcher.addPattern("*.log", ".");
+
+    var state = GitignoreState.init(allocator, &matcher);
+    defer state.deinit();
+
+    try state.addPattern("*.tmp", ".");
+
+    // Clone
+    var cloned = state.clone();
+    defer cloned.deinit();
+
+    // Clone has same base but no local patterns
+    try std.testing.expect(cloned.base == state.base);
+    try std.testing.expectEqual(@as(usize, 1), cloned.patternCount()); // Only base
+    try std.testing.expectEqual(@as(usize, 0), cloned.localPatternCount());
+
+    // Original still has local patterns
+    try std.testing.expectEqual(@as(usize, 2), state.patternCount());
+    try std.testing.expectEqual(@as(usize, 1), state.localPatternCount());
+}
+
+test "GitignoreState: deepClone copies local patterns" {
+    const allocator = std.testing.allocator;
+
+    var matcher = GitignoreMatcher.init(allocator);
+    defer matcher.deinit();
+
+    try matcher.addPattern("*.log", ".");
+
+    var state = GitignoreState.init(allocator, &matcher);
+    defer state.deinit();
+
+    try state.addPattern("*.tmp", ".");
+    try state.addPattern("build/", ".");
+
+    // Deep clone
+    var cloned = try state.deepClone();
+    defer cloned.deinit();
+
+    // Clone has same base AND copies of local patterns
+    try std.testing.expect(cloned.base == state.base);
+    try std.testing.expectEqual(@as(usize, 3), cloned.patternCount());
+    try std.testing.expectEqual(@as(usize, 2), cloned.localPatternCount());
+
+    // Patterns work in clone
+    try std.testing.expect(cloned.isIgnoredFile("debug.log"));
+    try std.testing.expect(cloned.isIgnoredFile("file.tmp"));
+    try std.testing.expect(cloned.isIgnoredDir("build"));
+}
+
+test "GitignoreState: local patterns override base" {
+    const allocator = std.testing.allocator;
+
+    var matcher = GitignoreMatcher.init(allocator);
+    defer matcher.deinit();
+
+    try matcher.addPattern("*.log", "."); // Ignore all .log
+
+    var state = GitignoreState.init(allocator, &matcher);
+    defer state.deinit();
+
+    // Add negation locally
+    try state.addPattern("!important.log", ".");
+
+    try std.testing.expect(state.isIgnoredFile("debug.log"));
+    try std.testing.expect(!state.isIgnoredFile("important.log")); // Negated locally
+}
+
+test "GitignoreState: no base patterns" {
+    const allocator = std.testing.allocator;
+
+    var state = GitignoreState.init(allocator, null);
+    defer state.deinit();
+
+    try state.addPattern("*.log", ".");
+    try state.addPattern("build/", ".");
+
+    try std.testing.expectEqual(@as(usize, 2), state.patternCount());
+    try std.testing.expect(state.isIgnoredFile("test.log"));
+    try std.testing.expect(state.isIgnoredDir("build"));
+    try std.testing.expect(!state.isIgnoredFile("main.zig"));
 }
