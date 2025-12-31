@@ -40,20 +40,26 @@ fn getRelativePath(path: []const u8, root: []const u8) ?[]const u8 {
         return path;
     }
 
-    // Check if path starts with root
-    if (path.len < root.len) return null;
+    // Normalize root by removing trailing slash for comparison
+    var normalized_root = root;
+    if (normalized_root.len > 0 and normalized_root[normalized_root.len - 1] == '/') {
+        normalized_root = normalized_root[0 .. normalized_root.len - 1];
+    }
 
-    if (!std.mem.startsWith(u8, path, root)) {
+    // Check if path starts with root
+    if (path.len < normalized_root.len) return null;
+
+    if (!std.mem.startsWith(u8, path, normalized_root)) {
         return null;
     }
 
     // Path must either equal root or have a separator after root
-    if (path.len == root.len) {
+    if (path.len == normalized_root.len) {
         return "";
     }
 
-    if (path[root.len] == '/') {
-        return path[root.len + 1 ..];
+    if (path[normalized_root.len] == '/') {
+        return path[normalized_root.len + 1 ..];
     }
 
     return null;
@@ -418,4 +424,162 @@ test "getRelativePath" {
     try std.testing.expectEqualStrings("sub/file.txt", getRelativePath("dir/sub/file.txt", "dir").?);
     try std.testing.expect(getRelativePath("other/file.txt", "dir") == null);
     try std.testing.expectEqualStrings("file.txt", getRelativePath("file.txt", ".").?);
+}
+
+test "getRelativePath edge cases" {
+    // Empty root treated as current directory
+    try std.testing.expectEqualStrings("file.txt", getRelativePath("file.txt", "").?);
+
+    // Path equals root returns empty string
+    try std.testing.expectEqualStrings("", getRelativePath("dir", "dir").?);
+
+    // Path shorter than root
+    try std.testing.expect(getRelativePath("d", "dir") == null);
+
+    // Path is prefix but no separator
+    try std.testing.expect(getRelativePath("directory/file.txt", "dir") == null);
+
+    // Root with trailing slash should work
+    try std.testing.expectEqualStrings("file.txt", getRelativePath("tests/fixtures/file.txt", "tests/fixtures/").?);
+    try std.testing.expectEqualStrings("ignored.txt", getRelativePath("tests/fixtures/ignored.txt", "tests/fixtures/").?);
+}
+
+test "glob question mark" {
+    try std.testing.expect(globMatch("?", "a"));
+    try std.testing.expect(globMatch("?", "x"));
+    try std.testing.expect(!globMatch("?", ""));
+    try std.testing.expect(!globMatch("?", "ab"));
+    try std.testing.expect(globMatch("a?c", "abc"));
+    try std.testing.expect(!globMatch("a?c", "ac"));
+}
+
+test "glob escaped characters" {
+    try std.testing.expect(globMatch("\\*", "*"));
+    try std.testing.expect(!globMatch("\\*", "a"));
+    try std.testing.expect(globMatch("a\\*b", "a*b"));
+}
+
+test "glob empty pattern" {
+    try std.testing.expect(globMatch("", ""));
+    try std.testing.expect(!globMatch("", "a"));
+}
+
+test "glob negated character class" {
+    try std.testing.expect(globMatch("[!abc]", "d"));
+    try std.testing.expect(globMatch("[!abc]", "x"));
+    try std.testing.expect(!globMatch("[!abc]", "a"));
+    try std.testing.expect(!globMatch("[!abc]", "b"));
+}
+
+test "glob single star does not cross slash" {
+    try std.testing.expect(globMatch("*.txt", "file.txt"));
+    try std.testing.expect(!globMatch("*.txt", "dir/file.txt"));
+    try std.testing.expect(globMatch("src/*.zig", "src/main.zig"));
+    try std.testing.expect(!globMatch("src/*.zig", "src/sub/main.zig"));
+}
+
+test "gitignore directory only pattern" {
+    const allocator = std.testing.allocator;
+
+    var matcher = GitignoreMatcher.init(allocator);
+    defer matcher.deinit();
+
+    try matcher.addPattern("build/", "."); // Directory only pattern
+
+    // Should match directories
+    try std.testing.expect(matcher.isIgnoredDir("build"));
+
+    // Should NOT match files
+    try std.testing.expect(!matcher.isIgnoredFile("build"));
+}
+
+test "gitignore double star middle" {
+    try std.testing.expect(globMatch("a/**/b", "a/b"));
+    try std.testing.expect(globMatch("a/**/b", "a/x/b"));
+    try std.testing.expect(globMatch("a/**/b", "a/x/y/z/b"));
+    try std.testing.expect(!globMatch("a/**/b", "a/x/c"));
+}
+
+test "gitignore comment lines" {
+    const allocator = std.testing.allocator;
+
+    var matcher = GitignoreMatcher.init(allocator);
+    defer matcher.deinit();
+
+    try matcher.addPattern("# this is a comment", ".");
+    try matcher.addPattern("*.log", ".");
+
+    // Comment should be ignored, *.log should work
+    try std.testing.expect(matcher.isIgnoredFile("debug.log"));
+    try std.testing.expectEqual(@as(usize, 1), matcher.patterns.items.len);
+}
+
+test "gitignore whitespace trimming" {
+    const allocator = std.testing.allocator;
+
+    var matcher = GitignoreMatcher.init(allocator);
+    defer matcher.deinit();
+
+    try matcher.addPattern("  *.log  ", "."); // Leading/trailing whitespace
+
+    try std.testing.expect(matcher.isIgnoredFile("debug.log"));
+}
+
+test "gitignore empty lines" {
+    const allocator = std.testing.allocator;
+
+    var matcher = GitignoreMatcher.init(allocator);
+    defer matcher.deinit();
+
+    try matcher.addPattern("", ".");
+    try matcher.addPattern("   ", ".");
+    try matcher.addPattern("*.log", ".");
+
+    // Empty lines should be skipped
+    try std.testing.expectEqual(@as(usize, 1), matcher.patterns.items.len);
+}
+
+test "isCommonIgnoredDir" {
+    try std.testing.expect(GitignoreMatcher.isCommonIgnoredDir(".git"));
+    try std.testing.expect(GitignoreMatcher.isCommonIgnoredDir(".svn"));
+    try std.testing.expect(GitignoreMatcher.isCommonIgnoredDir(".hg"));
+    try std.testing.expect(!GitignoreMatcher.isCommonIgnoredDir("node_modules"));
+    try std.testing.expect(!GitignoreMatcher.isCommonIgnoredDir("src"));
+    try std.testing.expect(!GitignoreMatcher.isCommonIgnoredDir(".gitignore"));
+}
+
+test "gitignore pattern with slash" {
+    const allocator = std.testing.allocator;
+
+    var matcher = GitignoreMatcher.init(allocator);
+    defer matcher.deinit();
+
+    // Pattern with slash should only match relative to root
+    try matcher.addPattern("src/*.txt", ".");
+
+    try std.testing.expect(matcher.isIgnoredFile("src/file.txt"));
+    try std.testing.expect(!matcher.isIgnoredFile("other/file.txt"));
+}
+
+test "gitignore negation override" {
+    const allocator = std.testing.allocator;
+
+    var matcher = GitignoreMatcher.init(allocator);
+    defer matcher.deinit();
+
+    try matcher.addPattern("*.log", ".");
+    try matcher.addPattern("!important.log", ".");
+
+    try std.testing.expect(matcher.isIgnoredFile("debug.log"));
+    try std.testing.expect(matcher.isIgnoredFile("error.log"));
+    try std.testing.expect(!matcher.isIgnoredFile("important.log"));
+}
+
+test "patternContainsSlash" {
+    try std.testing.expect(!patternContainsSlash("*.txt"));
+    try std.testing.expect(patternContainsSlash("src/*.txt"));
+    try std.testing.expect(patternContainsSlash("a/b/c"));
+    // Leading/trailing slashes don't count
+    try std.testing.expect(!patternContainsSlash("/build"));
+    try std.testing.expect(!patternContainsSlash("build/"));
 }

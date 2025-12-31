@@ -298,3 +298,189 @@ pub const Output = struct {
         try writer.interface.flush();
     }
 };
+
+// Tests
+
+test "FileBuffer init" {
+    const allocator = std.testing.allocator;
+    const config = main.Config{
+        .pattern = "test",
+        .paths = &[_][]const u8{"."},
+    };
+
+    var buf = FileBuffer.init(allocator, config, false, false);
+    defer buf.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), buf.match_count);
+    try std.testing.expect(!buf.hasMatches());
+    try std.testing.expect(buf.file_path == null);
+}
+
+test "FileBuffer addMatch flat no color" {
+    const allocator = std.testing.allocator;
+    const config = main.Config{
+        .pattern = "test",
+        .paths = &[_][]const u8{"."},
+        .line_number = true,
+    };
+
+    var buf = FileBuffer.init(allocator, config, false, false); // no color, no heading
+    defer buf.deinit();
+
+    try buf.addMatch(.{
+        .file_path = "test.txt",
+        .line_number = 42,
+        .line_content = "hello world test",
+        .match_start = 12,
+        .match_end = 16,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), buf.match_count);
+    try std.testing.expect(buf.hasMatches());
+
+    // Check output format is flat: file:line:content
+    const output = buf.getBuffer();
+    try std.testing.expect(std.mem.indexOf(u8, output, "test.txt:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "42:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "hello world test") != null);
+}
+
+test "FileBuffer addMatch heading no color" {
+    const allocator = std.testing.allocator;
+    const config = main.Config{
+        .pattern = "test",
+        .paths = &[_][]const u8{"."},
+        .line_number = true,
+    };
+
+    var buf = FileBuffer.init(allocator, config, false, true); // no color, heading mode
+    defer buf.deinit();
+
+    try buf.addMatch(.{
+        .file_path = "test.txt",
+        .line_number = 10,
+        .line_content = "match here",
+        .match_start = 0,
+        .match_end = 5,
+    });
+
+    const output = buf.getBuffer();
+    // In heading mode, first line should be just the filename
+    try std.testing.expect(std.mem.startsWith(u8, output, "test.txt\n"));
+}
+
+test "FileBuffer files_with_matches" {
+    const allocator = std.testing.allocator;
+    const config = main.Config{
+        .pattern = "test",
+        .paths = &[_][]const u8{"."},
+        .files_with_matches = true,
+    };
+
+    var buf = FileBuffer.init(allocator, config, false, false);
+    defer buf.deinit();
+
+    try buf.addMatch(.{
+        .file_path = "myfile.txt",
+        .line_number = 1,
+        .line_content = "content",
+        .match_start = 0,
+        .match_end = 7,
+    });
+
+    const output = buf.getBuffer();
+    // Should only contain filename
+    try std.testing.expectEqualStrings("myfile.txt\n", output);
+}
+
+test "FileBuffer match_count increments" {
+    const allocator = std.testing.allocator;
+    const config = main.Config{
+        .pattern = "test",
+        .paths = &[_][]const u8{"."},
+    };
+
+    var buf = FileBuffer.init(allocator, config, false, false);
+    defer buf.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), buf.getMatchCount());
+
+    try buf.addMatch(.{
+        .file_path = "file.txt",
+        .line_number = 1,
+        .line_content = "a",
+        .match_start = 0,
+        .match_end = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), buf.getMatchCount());
+
+    try buf.addMatch(.{
+        .file_path = "file.txt",
+        .line_number = 2,
+        .line_content = "b",
+        .match_start = 0,
+        .match_end = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 2), buf.getMatchCount());
+}
+
+test "FileBuffer addMatch with color" {
+    const allocator = std.testing.allocator;
+    const config = main.Config{
+        .pattern = "test",
+        .paths = &[_][]const u8{"."},
+        .line_number = true,
+    };
+
+    var buf = FileBuffer.init(allocator, config, true, false); // color enabled
+    defer buf.deinit();
+
+    try buf.addMatch(.{
+        .file_path = "test.txt",
+        .line_number = 1,
+        .line_content = "hello test world",
+        .match_start = 6,
+        .match_end = 10,
+    });
+
+    const output = buf.getBuffer();
+    // Should contain ANSI escape codes
+    try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[") != null);
+}
+
+test "FileBuffer getBuffer empty" {
+    const allocator = std.testing.allocator;
+    const config = main.Config{
+        .pattern = "test",
+        .paths = &[_][]const u8{"."},
+    };
+
+    var buf = FileBuffer.init(allocator, config, false, false);
+    defer buf.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), buf.getBuffer().len);
+}
+
+test "FileBuffer no line number" {
+    const allocator = std.testing.allocator;
+    const config = main.Config{
+        .pattern = "test",
+        .paths = &[_][]const u8{"."},
+        .line_number = false,
+    };
+
+    var buf = FileBuffer.init(allocator, config, false, false);
+    defer buf.deinit();
+
+    try buf.addMatch(.{
+        .file_path = "file.txt",
+        .line_number = 99,
+        .line_content = "content",
+        .match_start = 0,
+        .match_end = 7,
+    });
+
+    const output = buf.getBuffer();
+    // Should not contain line number (99)
+    try std.testing.expect(std.mem.indexOf(u8, output, "99:") == null);
+}

@@ -111,7 +111,7 @@ pub const Matcher = struct {
         return null;
     }
 
-    fn containsRegexMetaChars(pattern: []const u8) bool {
+    pub fn containsRegexMetaChars(pattern: []const u8) bool {
         for (pattern) |c| {
             switch (c) {
                 '.', '*', '+', '?', '[', ']', '(', ')', '{', '}', '|', '^', '$', '\\' => return true,
@@ -143,5 +143,140 @@ test "case insensitive matching" {
     try std.testing.expect(m.matches("HELLO world"));
     try std.testing.expect(m.matches("Hello"));
     try std.testing.expect(m.matches("hElLo"));
+}
+
+test "matcher regex pattern" {
+    const allocator = std.testing.allocator;
+
+    // Pattern with metacharacters should use regex
+    var m = try Matcher.init(allocator, "hel+o", false);
+    defer m.deinit();
+
+    try std.testing.expect(!m.is_literal);
+    try std.testing.expect(m.regex_engine != null);
+    try std.testing.expect(m.matches("hello"));
+    try std.testing.expect(m.matches("helllo"));
+    try std.testing.expect(!m.matches("heo"));
+}
+
+test "matcher findFirst returns position" {
+    const allocator = std.testing.allocator;
+
+    var m = try Matcher.init(allocator, "world", false);
+    defer m.deinit();
+
+    const result = m.findFirst("hello world");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(usize, 6), result.?.start);
+    try std.testing.expectEqual(@as(usize, 11), result.?.end);
+}
+
+test "matcher no match returns null" {
+    const allocator = std.testing.allocator;
+
+    var m = try Matcher.init(allocator, "xyz", false);
+    defer m.deinit();
+
+    try std.testing.expect(m.findFirst("hello") == null);
+    try std.testing.expect(!m.matches("hello"));
+}
+
+test "matcher empty haystack" {
+    const allocator = std.testing.allocator;
+
+    var m = try Matcher.init(allocator, "test", false);
+    defer m.deinit();
+
+    try std.testing.expect(m.findFirst("") == null);
+    try std.testing.expect(!m.matches(""));
+}
+
+test "matcher pattern at start" {
+    const allocator = std.testing.allocator;
+
+    var m = try Matcher.init(allocator, "hello", false);
+    defer m.deinit();
+
+    const result = m.findFirst("hello world");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(usize, 0), result.?.start);
+}
+
+test "matcher pattern at end" {
+    const allocator = std.testing.allocator;
+
+    var m = try Matcher.init(allocator, "world", false);
+    defer m.deinit();
+
+    const result = m.findFirst("hello world");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(usize, 6), result.?.start);
+    try std.testing.expectEqual(@as(usize, 11), result.?.end);
+}
+
+test "matcher multiple matches returns first" {
+    const allocator = std.testing.allocator;
+
+    var m = try Matcher.init(allocator, "ab", false);
+    defer m.deinit();
+
+    const result = m.findFirst("ab ab ab");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(usize, 0), result.?.start);
+}
+
+test "containsRegexMetaChars" {
+    // All metacharacters should be detected
+    try std.testing.expect(Matcher.containsRegexMetaChars("."));
+    try std.testing.expect(Matcher.containsRegexMetaChars("*"));
+    try std.testing.expect(Matcher.containsRegexMetaChars("+"));
+    try std.testing.expect(Matcher.containsRegexMetaChars("?"));
+    try std.testing.expect(Matcher.containsRegexMetaChars("["));
+    try std.testing.expect(Matcher.containsRegexMetaChars("]"));
+    try std.testing.expect(Matcher.containsRegexMetaChars("("));
+    try std.testing.expect(Matcher.containsRegexMetaChars(")"));
+    try std.testing.expect(Matcher.containsRegexMetaChars("{"));
+    try std.testing.expect(Matcher.containsRegexMetaChars("}"));
+    try std.testing.expect(Matcher.containsRegexMetaChars("|"));
+    try std.testing.expect(Matcher.containsRegexMetaChars("^"));
+    try std.testing.expect(Matcher.containsRegexMetaChars("$"));
+    try std.testing.expect(Matcher.containsRegexMetaChars("\\"));
+
+    // Plain text should not be detected
+    try std.testing.expect(!Matcher.containsRegexMetaChars("hello"));
+    try std.testing.expect(!Matcher.containsRegexMetaChars("test123"));
+    try std.testing.expect(!Matcher.containsRegexMetaChars(""));
+}
+
+test "matcher literal is detected" {
+    const allocator = std.testing.allocator;
+
+    var m = try Matcher.init(allocator, "hello", false);
+    defer m.deinit();
+
+    try std.testing.expect(m.is_literal);
+    try std.testing.expect(m.regex_engine == null);
+}
+
+test "matcher case insensitive creates lower pattern" {
+    const allocator = std.testing.allocator;
+
+    var m = try Matcher.init(allocator, "HeLLo", true);
+    defer m.deinit();
+
+    try std.testing.expect(m.lower_pattern != null);
+    try std.testing.expectEqualStrings("hello", m.lower_pattern.?);
+}
+
+test "matcher case insensitive position" {
+    const allocator = std.testing.allocator;
+
+    var m = try Matcher.init(allocator, "WORLD", true);
+    defer m.deinit();
+
+    const result = m.findFirst("hello world");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(usize, 6), result.?.start);
+    try std.testing.expectEqual(@as(usize, 11), result.?.end);
 }
 

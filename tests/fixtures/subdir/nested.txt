@@ -1,0 +1,3 @@
+Nested file in subdirectory.
+This file contains PATTERN as well.
+Used for testing recursive search.

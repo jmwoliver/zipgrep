@@ -184,5 +184,85 @@ pub const Walker = struct {
 };
 
 test "walker initialization" {
-    // Basic initialization test
+    const allocator = std.testing.allocator;
+
+    // Create minimal dependencies for initialization test
+    const config = main.Config{
+        .pattern = "test",
+        .paths = &[_][]const u8{"."},
+    };
+
+    var pattern_matcher = try matcher_mod.Matcher.init(allocator, "test", false);
+    defer pattern_matcher.deinit();
+
+    var ignore_matcher = gitignore.GitignoreMatcher.init(allocator);
+    defer ignore_matcher.deinit();
+
+    const stdout = std.io.getStdOut();
+    var out = output.Output.init(stdout, config);
+
+    var w = try Walker.init(
+        allocator,
+        config,
+        &pattern_matcher,
+        &ignore_matcher,
+        &out,
+    );
+    defer w.deinit();
+
+    // Walker should be initialized with the correct config
+    try std.testing.expectEqualStrings("test", w.config.pattern);
+}
+
+test "walker init without ignore matcher" {
+    const allocator = std.testing.allocator;
+
+    const config = main.Config{
+        .pattern = "test",
+        .paths = &[_][]const u8{"."},
+        .no_ignore = true,
+    };
+
+    var pattern_matcher = try matcher_mod.Matcher.init(allocator, "test", false);
+    defer pattern_matcher.deinit();
+
+    const stdout = std.io.getStdOut();
+    var out = output.Output.init(stdout, config);
+
+    var w = try Walker.init(
+        allocator,
+        config,
+        &pattern_matcher,
+        null, // No ignore matcher
+        &out,
+    );
+    defer w.deinit();
+
+    try std.testing.expect(w.ignore_matcher == null);
+}
+
+test "walker deinit does not crash" {
+    const allocator = std.testing.allocator;
+
+    const config = main.Config{
+        .pattern = "test",
+        .paths = &[_][]const u8{"."},
+    };
+
+    var pattern_matcher = try matcher_mod.Matcher.init(allocator, "test", false);
+    defer pattern_matcher.deinit();
+
+    const stdout = std.io.getStdOut();
+    var out = output.Output.init(stdout, config);
+
+    var w = try Walker.init(
+        allocator,
+        config,
+        &pattern_matcher,
+        null,
+        &out,
+    );
+
+    // Should not crash
+    w.deinit();
 }

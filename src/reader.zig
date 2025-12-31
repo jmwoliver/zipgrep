@@ -178,3 +178,127 @@ test "LineIterator basic" {
 test "readFile buffered" {
     // This test would need a real file - skipping for now
 }
+
+test "LineIterator empty input" {
+    var iter = LineIterator.init("");
+    try std.testing.expect(iter.next() == null);
+}
+
+test "LineIterator single line no newline" {
+    const data = "single line without newline";
+    var iter = LineIterator.init(data);
+
+    const line = iter.next().?;
+    try std.testing.expectEqualStrings("single line without newline", line.content);
+    try std.testing.expectEqual(@as(usize, 1), line.number);
+
+    try std.testing.expect(iter.next() == null);
+}
+
+test "LineIterator trailing newline" {
+    const data = "line1\nline2\n";
+    var iter = LineIterator.init(data);
+
+    const l1 = iter.next().?;
+    try std.testing.expectEqualStrings("line1", l1.content);
+
+    const l2 = iter.next().?;
+    try std.testing.expectEqualStrings("line2", l2.content);
+
+    // No third line - trailing newline doesn't create empty line
+    try std.testing.expect(iter.next() == null);
+}
+
+test "LineIterator consecutive newlines" {
+    const data = "line1\n\nline3";
+    var iter = LineIterator.init(data);
+
+    const l1 = iter.next().?;
+    try std.testing.expectEqualStrings("line1", l1.content);
+    try std.testing.expectEqual(@as(usize, 1), l1.number);
+
+    const l2 = iter.next().?;
+    try std.testing.expectEqualStrings("", l2.content); // Empty line
+    try std.testing.expectEqual(@as(usize, 2), l2.number);
+
+    const l3 = iter.next().?;
+    try std.testing.expectEqualStrings("line3", l3.content);
+    try std.testing.expectEqual(@as(usize, 3), l3.number);
+
+    try std.testing.expect(iter.next() == null);
+}
+
+test "LineIterator line numbers correct" {
+    const data = "a\nb\nc\nd\ne";
+    var iter = LineIterator.init(data);
+
+    for (1..6) |expected_num| {
+        const line = iter.next().?;
+        try std.testing.expectEqual(expected_num, line.number);
+    }
+
+    try std.testing.expect(iter.next() == null);
+}
+
+test "FileContent bytes mmap" {
+    // Test that bytes() returns correct data for mmap variant
+    // Note: We can't easily test mmap without a real file, so this is a partial test
+    const test_data = "test content";
+    const content = FileContent{ .buffered = .{
+        .data = @constCast(test_data),
+        .allocator = std.testing.allocator,
+    } };
+
+    try std.testing.expectEqualStrings("test content", content.bytes());
+}
+
+test "BufferedContent deinit" {
+    const allocator = std.testing.allocator;
+
+    // Allocate some data
+    const data = try allocator.alloc(u8, 10);
+    @memset(data, 'x');
+
+    var content = BufferedContent{
+        .data = data,
+        .allocator = allocator,
+    };
+
+    // deinit should free without error
+    content.deinit();
+}
+
+test "BufferedContent deinit empty" {
+    // Empty data should not cause issues on deinit
+    var content = BufferedContent{
+        .data = &[_]u8{},
+        .allocator = std.testing.allocator,
+    };
+
+    content.deinit(); // Should not crash
+}
+
+test "LineIterator single newline" {
+    const data = "\n";
+    var iter = LineIterator.init(data);
+
+    const line = iter.next().?;
+    try std.testing.expectEqualStrings("", line.content);
+    try std.testing.expectEqual(@as(usize, 1), line.number);
+
+    try std.testing.expect(iter.next() == null);
+}
+
+test "LineIterator windows line endings" {
+    // Note: Current implementation only handles \n, not \r\n
+    // This test documents the behavior
+    const data = "line1\r\nline2";
+    var iter = LineIterator.init(data);
+
+    const l1 = iter.next().?;
+    // \r will be included in the line content
+    try std.testing.expectEqualStrings("line1\r", l1.content);
+
+    const l2 = iter.next().?;
+    try std.testing.expectEqualStrings("line2", l2.content);
+}

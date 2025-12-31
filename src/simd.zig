@@ -86,6 +86,80 @@ test "findSubstring basic" {
     try std.testing.expectEqual(@as(?usize, null), findSubstring(data, "xyz"));
 }
 
+test "findSubstring empty needle" {
+    try std.testing.expectEqual(@as(?usize, 0), findSubstring("hello", ""));
+    try std.testing.expectEqual(@as(?usize, 0), findSubstring("", ""));
+}
+
+test "findSubstring needle longer than haystack" {
+    try std.testing.expectEqual(@as(?usize, null), findSubstring("hi", "hello"));
+    try std.testing.expectEqual(@as(?usize, null), findSubstring("", "x"));
+}
+
+test "findSubstring single char" {
+    try std.testing.expectEqual(@as(?usize, 0), findSubstring("abc", "a"));
+    try std.testing.expectEqual(@as(?usize, 1), findSubstring("abc", "b"));
+    try std.testing.expectEqual(@as(?usize, 2), findSubstring("abc", "c"));
+    try std.testing.expectEqual(@as(?usize, null), findSubstring("abc", "d"));
+}
+
+test "findSubstring at start" {
+    try std.testing.expectEqual(@as(?usize, 0), findSubstring("hello world", "hello"));
+    try std.testing.expectEqual(@as(?usize, 0), findSubstring("test", "test"));
+}
+
+test "findSubstring at end" {
+    try std.testing.expectEqual(@as(?usize, 6), findSubstring("hello world", "world"));
+    try std.testing.expectEqual(@as(?usize, 3), findSubstring("abcdef", "def"));
+}
+
+test "findSubstring no match" {
+    try std.testing.expectEqual(@as(?usize, null), findSubstring("hello", "xyz"));
+    try std.testing.expectEqual(@as(?usize, null), findSubstring("aaa", "aaaa"));
+}
+
+test "findSubstring partial match not found" {
+    // Partial prefix that doesn't complete
+    try std.testing.expectEqual(@as(?usize, null), findSubstring("hel", "hello"));
+    try std.testing.expectEqual(@as(?usize, null), findSubstring("abc", "abd"));
+}
+
+test "findSubstring overlapping occurrences" {
+    // Should return first match
+    try std.testing.expectEqual(@as(?usize, 0), findSubstring("aaaa", "aa"));
+    try std.testing.expectEqual(@as(?usize, 0), findSubstring("abab", "ab"));
+}
+
+test "findSubstring exact match" {
+    try std.testing.expectEqual(@as(?usize, 0), findSubstring("hello", "hello"));
+    try std.testing.expectEqual(@as(?usize, 0), findSubstring("x", "x"));
+}
+
+test "findNewline basic" {
+    try std.testing.expectEqual(@as(?usize, 5), findNewline("hello\nworld"));
+    try std.testing.expectEqual(@as(?usize, 0), findNewline("\ntest"));
+}
+
+test "findNewline not found" {
+    try std.testing.expectEqual(@as(?usize, null), findNewline("hello world"));
+    try std.testing.expectEqual(@as(?usize, null), findNewline("no newlines here"));
+}
+
+test "findNewline at start" {
+    try std.testing.expectEqual(@as(?usize, 0), findNewline("\n"));
+    try std.testing.expectEqual(@as(?usize, 0), findNewline("\nhello"));
+}
+
+test "findNewline empty input" {
+    try std.testing.expectEqual(@as(?usize, null), findNewline(""));
+}
+
+test "findNewline multiple newlines" {
+    // Should return first newline
+    try std.testing.expectEqual(@as(?usize, 1), findNewline("a\nb\nc"));
+    try std.testing.expectEqual(@as(?usize, 0), findNewline("\n\n\n"));
+}
+
 
 
 

@@ -508,45 +508,74 @@ const Compiler = struct {
         var frag = frag_in;
         switch (quantifier) {
             '*' => {
-                // Create split state for zero-or-more
+                // Zero-or-more: split state with two paths
+                // out1 = go to fragment (match more), out2 = skip (set by patch later)
                 const split = try self.addState(.{
                     .transition = .epsilon,
-                    .out1 = frag.start,
+                    .out1 = frag.start, // Path 1: enter the fragment to match
+                    // out2 will be set by patch() to point to continuation
                 });
+                // Loop back: fragment's end points back to split
                 self.patch(frag.out, split);
                 frag.out.deinit(self.allocator);
 
+                // The "out" of this fragment is split's out2 (the skip path)
+                // We need patch() to set out2 instead of out1 for split
+                // But patch() always sets out1, so we need a different approach:
+                // Use the fact that split is in the out list, and we need to
+                // set its out2 when concatenating with the next fragment.
+                //
+                // Actually, the standard Thompson construction puts split in out
+                // so that when patched, out1 gets set to next state. But we already
+                // set out1 to frag.start for looping.
+                //
+                // Solution: Create a second epsilon state for the "skip" path
+                const skip = try self.addState(.{ .transition = .epsilon });
+
+                // Update split to have both paths
+                self.states.items[split].out2 = skip;
+
                 var out = std.ArrayListUnmanaged(usize){};
-                try out.append(self.allocator, split);
+                try out.append(self.allocator, skip);
 
                 return Fragment{ .start = split, .out = out };
             },
             '+' => {
-                // One-or-more: frag -> split -> frag | out
+                // One-or-more: must match fragment at least once, then optionally more
+                // frag.start -> frag -> split -> (loop back to frag.start OR skip to next)
                 const split = try self.addState(.{
                     .transition = .epsilon,
-                    .out1 = frag.start,
+                    .out1 = frag.start, // Path 1: loop back for more matches
                 });
                 self.patch(frag.out, split);
                 frag.out.deinit(self.allocator);
 
+                // Create skip state for the "done matching" path
+                const skip = try self.addState(.{ .transition = .epsilon });
+                self.states.items[split].out2 = skip;
+
                 var out = std.ArrayListUnmanaged(usize){};
-                try out.append(self.allocator, split);
+                try out.append(self.allocator, skip);
 
                 return Fragment{ .start = frag.start, .out = out };
             },
             '?' => {
-                // Zero-or-one: split -> frag | out
+                // Zero-or-one: split state with two paths
+                // out1 = go to fragment (match), out2 = skip to next
+                const skip = try self.addState(.{ .transition = .epsilon });
+
                 const split = try self.addState(.{
                     .transition = .epsilon,
-                    .out1 = frag.start,
+                    .out1 = frag.start, // Path 1: enter fragment
+                    .out2 = skip, // Path 2: skip fragment
                 });
 
+                // Both fragment's end AND skip need to go to next
                 var new_out = std.ArrayListUnmanaged(usize){};
                 for (frag.out.items) |out_state| {
                     try new_out.append(self.allocator, out_state);
                 }
-                try new_out.append(self.allocator, split);
+                try new_out.append(self.allocator, skip);
                 frag.out.deinit(self.allocator);
 
                 return Fragment{ .start = split, .out = new_out };
@@ -676,4 +705,254 @@ test "bitset operations" {
     try std.testing.expectEqual(@as(?usize, 64), iter.next());
     try std.testing.expectEqual(@as(?usize, 100), iter.next());
     try std.testing.expectEqual(@as(?usize, null), iter.next());
+}
+
+test "bitset clear" {
+    var bs = StateBitset.init();
+    bs.set(0);
+    bs.set(100);
+    bs.set(255);
+    try std.testing.expect(!bs.isEmpty());
+
+    bs.clear();
+    try std.testing.expect(bs.isEmpty());
+    try std.testing.expect(!bs.isSet(0));
+    try std.testing.expect(!bs.isSet(100));
+    try std.testing.expect(!bs.isSet(255));
+}
+
+test "bitset boundary" {
+    var bs = StateBitset.init();
+
+    // Test at MAX_STATES - 1 (last valid index)
+    bs.set(MAX_STATES - 1);
+    try std.testing.expect(bs.isSet(MAX_STATES - 1));
+
+    // Test at MAX_STATES (should be ignored/return false)
+    bs.set(MAX_STATES);
+    try std.testing.expect(!bs.isSet(MAX_STATES));
+}
+
+test "regex question mark" {
+    const allocator = std.testing.allocator;
+
+    var re = try Regex.compile(allocator, "ab?c");
+    defer re.deinit();
+
+    try std.testing.expect(re.find("ac") != null);
+    try std.testing.expect(re.find("abc") != null);
+    try std.testing.expect(re.find("abbc") == null);
+}
+
+test "regex nested groups" {
+    const allocator = std.testing.allocator;
+
+    var re = try Regex.compile(allocator, "(ab)+");
+    defer re.deinit();
+
+    try std.testing.expect(re.find("ab") != null);
+    try std.testing.expect(re.find("abab") != null);
+    try std.testing.expect(re.find("ababab") != null);
+    try std.testing.expect(re.find("a") == null);
+}
+
+test "regex escaped metacharacters" {
+    const allocator = std.testing.allocator;
+
+    var re = try Regex.compile(allocator, "a\\.b");
+    defer re.deinit();
+
+    try std.testing.expect(re.find("a.b") != null);
+    try std.testing.expect(re.find("axb") == null);
+}
+
+test "regex escape sequences" {
+    const allocator = std.testing.allocator;
+
+    var re = try Regex.compile(allocator, "a\\nb");
+    defer re.deinit();
+
+    try std.testing.expect(re.find("a\nb") != null);
+    try std.testing.expect(re.find("anb") == null);
+}
+
+test "regex negated character class" {
+    const allocator = std.testing.allocator;
+
+    var re = try Regex.compile(allocator, "[^abc]");
+    defer re.deinit();
+
+    try std.testing.expect(re.find("d") != null);
+    try std.testing.expect(re.find("x") != null);
+    try std.testing.expect(re.find("1") != null);
+    // Note: Single char strings "a", "b", "c" should not match
+    // But if there's other text around them they might
+    try std.testing.expect(re.find("xyz") != null);
+}
+
+test "regex character range" {
+    const allocator = std.testing.allocator;
+
+    var re = try Regex.compile(allocator, "[a-z]+");
+    defer re.deinit();
+
+    try std.testing.expect(re.find("hello") != null);
+    try std.testing.expect(re.find("xyz") != null);
+
+    var re2 = try Regex.compile(allocator, "[0-9]+");
+    defer re2.deinit();
+
+    try std.testing.expect(re2.find("123") != null);
+    try std.testing.expect(re2.find("test") == null);
+}
+
+test "regex combined quantifiers" {
+    const allocator = std.testing.allocator;
+
+    var re = try Regex.compile(allocator, "a+b*c?");
+    defer re.deinit();
+
+    try std.testing.expect(re.find("a") != null);
+    try std.testing.expect(re.find("ac") != null);
+    try std.testing.expect(re.find("ab") != null);
+    try std.testing.expect(re.find("abc") != null);
+    try std.testing.expect(re.find("aabbbc") != null);
+    try std.testing.expect(re.find("aaaa") != null);
+}
+
+test "regex empty pattern" {
+    const allocator = std.testing.allocator;
+
+    var re = try Regex.compile(allocator, "");
+    defer re.deinit();
+
+    // Empty pattern should match at start of any string
+    const result = re.find("hello");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(usize, 0), result.?.start);
+}
+
+test "regex no match" {
+    const allocator = std.testing.allocator;
+
+    var re = try Regex.compile(allocator, "xyz");
+    defer re.deinit();
+
+    try std.testing.expect(re.find("hello") == null);
+    try std.testing.expect(re.find("abc") == null);
+    try std.testing.expect(re.find("") == null);
+}
+
+test "regex match position" {
+    const allocator = std.testing.allocator;
+
+    var re = try Regex.compile(allocator, "world");
+    defer re.deinit();
+
+    const result = re.find("hello world");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(usize, 6), result.?.start);
+    try std.testing.expectEqual(@as(usize, 11), result.?.end);
+}
+
+test "regex match at start" {
+    const allocator = std.testing.allocator;
+
+    var re = try Regex.compile(allocator, "hello");
+    defer re.deinit();
+
+    const result = re.find("hello world");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(usize, 0), result.?.start);
+    try std.testing.expectEqual(@as(usize, 5), result.?.end);
+}
+
+test "regex literal prefix extraction" {
+    const allocator = std.testing.allocator;
+
+    // Pattern with literal prefix followed by regex
+    var re = try Regex.compile(allocator, "hello.*world");
+    defer re.deinit();
+
+    const prefix = re.getLiteralPrefix();
+    try std.testing.expect(prefix != null);
+    try std.testing.expectEqualStrings("hello", prefix.?);
+}
+
+test "regex literal prefix no prefix" {
+    const allocator = std.testing.allocator;
+
+    // Pattern starting with metacharacter
+    var re = try Regex.compile(allocator, ".*hello");
+    defer re.deinit();
+
+    const prefix = re.getLiteralPrefix();
+    try std.testing.expect(prefix == null);
+}
+
+test "regex compile error unmatched paren" {
+    const allocator = std.testing.allocator;
+
+    const result = Regex.compile(allocator, "(abc");
+    try std.testing.expectError(error.UnmatchedParen, result);
+}
+
+test "regex compile error unmatched bracket" {
+    const allocator = std.testing.allocator;
+
+    const result = Regex.compile(allocator, "[abc");
+    try std.testing.expectError(error.UnmatchedBracket, result);
+}
+
+test "regex compile error trailing backslash" {
+    const allocator = std.testing.allocator;
+
+    const result = Regex.compile(allocator, "abc\\");
+    try std.testing.expectError(error.TrailingBackslash, result);
+}
+
+test "CharClass add and contains" {
+    var cc = CharClass.init(false);
+    cc.add('a');
+    cc.add('b');
+    cc.add('z');
+
+    try std.testing.expect(cc.contains('a'));
+    try std.testing.expect(cc.contains('b'));
+    try std.testing.expect(cc.contains('z'));
+    try std.testing.expect(!cc.contains('c'));
+    try std.testing.expect(!cc.contains('x'));
+}
+
+test "CharClass addRange" {
+    var cc = CharClass.init(false);
+    cc.addRange('a', 'f');
+
+    try std.testing.expect(cc.contains('a'));
+    try std.testing.expect(cc.contains('c'));
+    try std.testing.expect(cc.contains('f'));
+    try std.testing.expect(!cc.contains('g'));
+    try std.testing.expect(!cc.contains('z'));
+}
+
+test "CharClass negated" {
+    var cc = CharClass.init(true); // negated
+    cc.add('a');
+    cc.add('b');
+
+    // Negated class: contains returns true for chars NOT in the set
+    try std.testing.expect(!cc.contains('a'));
+    try std.testing.expect(!cc.contains('b'));
+    try std.testing.expect(cc.contains('c'));
+    try std.testing.expect(cc.contains('z'));
+}
+
+test "regex dot does not match newline" {
+    const allocator = std.testing.allocator;
+
+    var re = try Regex.compile(allocator, "a.b");
+    defer re.deinit();
+
+    try std.testing.expect(re.find("axb") != null);
+    try std.testing.expect(re.find("a\nb") == null);
 }

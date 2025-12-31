@@ -52,6 +52,19 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     // Skip program name
     _ = args.skip();
 
+    // Collect all args into a slice
+    var args_list = std.ArrayListUnmanaged([]const u8){};
+    defer args_list.deinit(allocator);
+
+    while (args.next()) |arg| {
+        try args_list.append(allocator, arg);
+    }
+
+    return parseArgsFromSlice(allocator, args_list.items);
+}
+
+/// Parse arguments from a slice of strings (testable version)
+pub fn parseArgsFromSlice(allocator: std.mem.Allocator, args: []const []const u8) !Config {
     var pattern: ?[]const u8 = null;
     var paths = std.ArrayListUnmanaged([]const u8){};
     defer paths.deinit(allocator);
@@ -61,7 +74,9 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
         .paths = undefined,
     };
 
-    while (args.next()) |arg| {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (std.mem.startsWith(u8, arg, "-")) {
             if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
                 printHelp();
@@ -79,21 +94,23 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             } else if (std.mem.eql(u8, arg, "--hidden")) {
                 config.hidden = true;
             } else if (std.mem.eql(u8, arg, "-j") or std.mem.eql(u8, arg, "--threads")) {
-                if (args.next()) |num_str| {
-                    config.num_threads = std.fmt.parseInt(usize, num_str, 10) catch {
-                        std.debug.print("Invalid thread count: {s}\n", .{num_str});
+                i += 1;
+                if (i < args.len) {
+                    config.num_threads = std.fmt.parseInt(usize, args[i], 10) catch {
                         return error.InvalidArgument;
                     };
                 }
             } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--max-depth")) {
-                if (args.next()) |depth_str| {
-                    config.max_depth = std.fmt.parseInt(usize, depth_str, 10) catch {
-                        std.debug.print("Invalid max depth: {s}\n", .{depth_str});
+                i += 1;
+                if (i < args.len) {
+                    config.max_depth = std.fmt.parseInt(usize, args[i], 10) catch {
                         return error.InvalidArgument;
                     };
                 }
             } else if (std.mem.eql(u8, arg, "--color")) {
-                if (args.next()) |color_str| {
+                i += 1;
+                if (i < args.len) {
+                    const color_str = args[i];
                     if (std.mem.eql(u8, color_str, "always")) {
                         config.color = .always;
                     } else if (std.mem.eql(u8, color_str, "never")) {
@@ -101,7 +118,6 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                     } else if (std.mem.eql(u8, color_str, "auto")) {
                         config.color = .auto;
                     } else {
-                        std.debug.print("Invalid color mode: {s} (use: auto, always, never)\n", .{color_str});
                         return error.InvalidArgument;
                     }
                 }
@@ -110,7 +126,6 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             } else if (std.mem.eql(u8, arg, "--no-heading")) {
                 config.heading = .never;
             } else {
-                std.debug.print("Unknown option: {s}\n", .{arg});
                 return error.InvalidArgument;
             }
         } else {
@@ -123,8 +138,6 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     }
 
     if (pattern == null) {
-        std.debug.print("Error: No pattern specified\n\n", .{});
-        printHelp();
         return error.InvalidArgument;
     }
 
@@ -211,6 +224,249 @@ fn run(allocator: std.mem.Allocator, config: Config) !void {
     }
 }
 
-test "basic CLI parsing" {
-    // Basic tests will go here
+test "parseArgs pattern only" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{"searchterm"};
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expectEqualStrings("searchterm", config.pattern);
+    try std.testing.expectEqual(@as(usize, 1), config.paths.len);
+    try std.testing.expectEqualStrings(".", config.paths[0]); // Default path
+}
+
+test "parseArgs pattern and path" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "pattern", "src/" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expectEqualStrings("pattern", config.pattern);
+    try std.testing.expectEqual(@as(usize, 1), config.paths.len);
+    try std.testing.expectEqualStrings("src/", config.paths[0]);
+}
+
+test "parseArgs multiple paths" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "pattern", "src/", "lib/", "tests/" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expectEqual(@as(usize, 3), config.paths.len);
+    try std.testing.expectEqualStrings("src/", config.paths[0]);
+    try std.testing.expectEqualStrings("lib/", config.paths[1]);
+    try std.testing.expectEqualStrings("tests/", config.paths[2]);
+}
+
+test "parseArgs -i flag" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "-i", "pattern" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expect(config.ignore_case);
+}
+
+test "parseArgs --ignore-case flag" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "--ignore-case", "pattern" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expect(config.ignore_case);
+}
+
+test "parseArgs -c flag" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "-c", "pattern" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expect(config.count_only);
+}
+
+test "parseArgs -l flag" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "-l", "pattern" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expect(config.files_with_matches);
+}
+
+test "parseArgs --no-ignore flag" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "--no-ignore", "pattern" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expect(config.no_ignore);
+}
+
+test "parseArgs --hidden flag" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "--hidden", "pattern" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expect(config.hidden);
+}
+
+test "parseArgs -j threads" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "-j", "8", "pattern" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expectEqual(@as(?usize, 8), config.num_threads);
+}
+
+test "parseArgs --threads" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "--threads", "4", "pattern" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expectEqual(@as(?usize, 4), config.num_threads);
+}
+
+test "parseArgs -d depth" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "-d", "3", "pattern" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expectEqual(@as(?usize, 3), config.max_depth);
+}
+
+test "parseArgs --color always" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "--color", "always", "pattern" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expectEqual(ColorMode.always, config.color);
+}
+
+test "parseArgs --color never" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "--color", "never", "pattern" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expectEqual(ColorMode.never, config.color);
+}
+
+test "parseArgs --heading flag" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "--heading", "pattern" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expectEqual(HeadingMode.always, config.heading);
+}
+
+test "parseArgs --no-heading flag" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "--no-heading", "pattern" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expectEqual(HeadingMode.never, config.heading);
+}
+
+test "parseArgs invalid option" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "--invalid", "pattern" };
+
+    const result = parseArgsFromSlice(allocator, &args);
+    try std.testing.expectError(error.InvalidArgument, result);
+}
+
+test "parseArgs no pattern" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{};
+
+    const result = parseArgsFromSlice(allocator, &args);
+    try std.testing.expectError(error.InvalidArgument, result);
+}
+
+test "parseArgs invalid thread count" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "-j", "not_a_number", "pattern" };
+
+    const result = parseArgsFromSlice(allocator, &args);
+    try std.testing.expectError(error.InvalidArgument, result);
+}
+
+test "parseArgs invalid color mode" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "--color", "invalid", "pattern" };
+
+    const result = parseArgsFromSlice(allocator, &args);
+    try std.testing.expectError(error.InvalidArgument, result);
+}
+
+test "Config getNumThreads with value" {
+    const config = Config{
+        .pattern = "test",
+        .paths = &[_][]const u8{"."},
+        .num_threads = 16,
+    };
+
+    try std.testing.expectEqual(@as(usize, 16), config.getNumThreads());
+}
+
+test "Config getNumThreads default" {
+    const config = Config{
+        .pattern = "test",
+        .paths = &[_][]const u8{"."},
+        .num_threads = null,
+    };
+
+    // Should return CPU count or 4
+    const threads = config.getNumThreads();
+    try std.testing.expect(threads >= 1);
+}
+
+test "parseArgs combined flags" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "-i", "-c", "--hidden", "pattern", "src/" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expect(config.ignore_case);
+    try std.testing.expect(config.count_only);
+    try std.testing.expect(config.hidden);
+    try std.testing.expectEqualStrings("pattern", config.pattern);
+    try std.testing.expectEqualStrings("src/", config.paths[0]);
+}
+
+test "parseArgs flags after pattern" {
+    const allocator = std.testing.allocator;
+    // Note: Current implementation treats flags anywhere as flags
+    const args = [_][]const u8{ "pattern", "-i" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expect(config.ignore_case);
+    try std.testing.expectEqualStrings("pattern", config.pattern);
 }
