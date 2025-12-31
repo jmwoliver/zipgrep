@@ -419,3 +419,139 @@ test "integration: glob with recursive search" {
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "sample.txt") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "nested.txt") != null);
 }
+
+// ============================================================================
+// Word boundary with .* prefix pattern tests
+// ============================================================================
+
+test "integration: word boundary with greedy .* prefix finds valid match" {
+    // This test validates the fix for a bug where -w '.*_suffix' would fail
+    // to find matches when the LAST occurrence of _suffix in the line was not
+    // at a word boundary, even if EARLIER occurrences were valid.
+    //
+    // The bug: greedy .* would match to the last _suffix, word boundary check
+    // would fail, and we'd skip ALL occurrences instead of trying earlier ones.
+
+    const allocator = std.testing.allocator;
+
+    // Create a temp file with multiple _cache occurrences
+    // First two have word chars after them (not word boundary)
+    // Third one has a space after (valid word boundary)
+    // Fourth has word char after (not word boundary)
+    const test_content = "x_cache_y z_cache_w valid_cache here_cache_end\n";
+    const temp_path = "/tmp/zrep_test_word_boundary.txt";
+
+    // Write test file
+    {
+        const file = try std.fs.cwd().createFile(temp_path, .{});
+        defer file.close();
+        try file.writeAll(test_content);
+    }
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    // Run zrep with -w flag
+    const result = try runZrep(allocator, &.{ "-w", ".*_cache", temp_path });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Should find a match (the "valid_cache" occurrence has word boundary)
+    try std.testing.expect(result.stdout.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "valid_cache") != null);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "integration: word boundary with greedy .* prefix no valid match" {
+    // Test case where NO occurrences satisfy word boundary - should return no match
+
+    const allocator = std.testing.allocator;
+
+    // All _cache occurrences have word characters after them
+    const test_content = "x_cache_y z_cache_w a_cache_b\n";
+    const temp_path = "/tmp/zrep_test_no_word_boundary.txt";
+
+    // Write test file
+    {
+        const file = try std.fs.cwd().createFile(temp_path, .{});
+        defer file.close();
+        try file.writeAll(test_content);
+    }
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    // Run zrep with -w flag
+    const result = try runZrep(allocator, &.{ "-w", ".*_cache", temp_path });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Should NOT find a match (no _cache is at a word boundary)
+    try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
+}
+
+test "integration: word boundary with greedy .* long line" {
+    // Test with a longer line to ensure the fix works with many occurrences
+    // This simulates the real-world case of minified JS files
+
+    const allocator = std.testing.allocator;
+
+    // Build a long line with many _cache occurrences, only one valid
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(allocator);
+
+    // Add many non-boundary occurrences
+    for (0..50) |i| {
+        try content.writer(allocator).print("item{d}_cache_ext ", .{i});
+    }
+    // Add one valid word boundary occurrence
+    try content.appendSlice(allocator, "final_cache ");
+    // Add more non-boundary occurrences after
+    for (50..100) |i| {
+        try content.writer(allocator).print("item{d}_cache_more ", .{i});
+    }
+    try content.append(allocator, '\n');
+
+    const temp_path = "/tmp/zrep_test_long_line.txt";
+
+    // Write test file
+    {
+        const file = try std.fs.cwd().createFile(temp_path, .{});
+        defer file.close();
+        try file.writeAll(content.items);
+    }
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    // Run zrep with -w flag
+    const result = try runZrep(allocator, &.{ "-w", ".*_cache", temp_path });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Should find a match at "final_cache"
+    try std.testing.expect(result.stdout.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "final_cache") != null);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "integration: word boundary .* match at end of line" {
+    // Test where valid word boundary is at end of string
+
+    const allocator = std.testing.allocator;
+
+    // _suffix at end of line has implicit word boundary (end of string)
+    const test_content = "prefix_suffix_more text_suffix\n";
+    const temp_path = "/tmp/zrep_test_end_boundary.txt";
+
+    // Write test file
+    {
+        const file = try std.fs.cwd().createFile(temp_path, .{});
+        defer file.close();
+        try file.writeAll(test_content);
+    }
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    // Run zrep with -w flag
+    const result = try runZrep(allocator, &.{ "-w", ".*_suffix", temp_path });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Should find a match (last _suffix is at word boundary - end of line)
+    try std.testing.expect(result.stdout.len > 0);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}

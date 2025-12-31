@@ -403,3 +403,80 @@ test "word boundary disabled" {
     try std.testing.expect(m.matches("barfoobar"));
 }
 
+test "word boundary with .* prefix pattern" {
+    const allocator = std.testing.allocator;
+
+    // Pattern .*_cache with word boundary - should find first valid word boundary match
+    var m = try Matcher.init(allocator, ".*_cache", false, true);
+    defer m.deinit();
+
+    // For .*SUFFIX patterns, the match STARTS at position 0 (beginning of line).
+    // Word boundary check: start=0 is word boundary (beginning of string), end depends on suffix.
+    // "x_cache " - match from 0 to 7, end boundary: char at 7 is ' ' (non-word) = valid!
+    const input = "x_cache foo_cache bar_cache_baz";
+
+    // Should find match ending at first _cache (position 7) since it has valid word boundary
+    const result = m.findFirst(input);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(usize, 0), result.?.start);
+    try std.testing.expectEqual(@as(usize, 7), result.?.end); // "x_cache" = 7 chars
+}
+
+test "word boundary with .* prefix finds match at end of string" {
+    const allocator = std.testing.allocator;
+
+    var m = try Matcher.init(allocator, ".*_suffix", false, true);
+    defer m.deinit();
+
+    // For greedy .*, it matches up to the LAST _suffix
+    // The last _suffix ends at position 26 (end of string = word boundary)
+    // Word boundary check: start=0 (OK), end=26 (end of string = OK)
+    const input = "x_suffix_more text._suffix";
+
+    const result = m.findFirst(input);
+    try std.testing.expect(result != null);
+    // Should match ending at the last _suffix (position 26 = end of string)
+    try std.testing.expectEqual(@as(usize, 26), result.?.end);
+}
+
+test "word boundary .* pattern with all non-boundary occurrences" {
+    const allocator = std.testing.allocator;
+
+    var m = try Matcher.init(allocator, ".*_cache", false, true);
+    defer m.deinit();
+
+    // All _cache occurrences have word characters adjacent
+    const input = "x_cache_y a_cache_b";
+
+    // Should NOT match since no _cache is at a word boundary
+    try std.testing.expect(m.findFirst(input) == null);
+}
+
+test "word boundary .* pattern skips early non-boundary to find later valid match" {
+    const allocator = std.testing.allocator;
+
+    // This test validates the fix for the bug where .*_cache with -w failed
+    // to find matches in long lines. The issue was that the greedy .* would
+    // match to the LAST _cache occurrence, and if that didn't satisfy word
+    // boundary, we'd skip past ALL _cache occurrences and return no match.
+    //
+    // The fix returns matches ending at EACH _cache occurrence in turn,
+    // allowing word boundary validation to try each one.
+
+    var m = try Matcher.init(allocator, ".*_cache", false, true);
+    defer m.deinit();
+
+    // Multiple _cache occurrences (verified with Python re.finditer):
+    // - _cache at 1-7, next char: '_' (not word boundary)
+    // - _cache at 10-16, next char: '_' (not word boundary)
+    // - _cache at 19-25, next char: ' ' (VALID word boundary!)
+    // - _cache at 27-33, next char: '_' (not word boundary)
+    const input = "a_cache_ b_cache_ c_cache d_cache_x";
+
+    const result = m.findFirst(input);
+    try std.testing.expect(result != null);
+    // Should find match ending at "c_cache" (position 25) - the first with valid word boundary
+    try std.testing.expectEqual(@as(usize, 0), result.?.start);
+    try std.testing.expectEqual(@as(usize, 25), result.?.end);
+}
+

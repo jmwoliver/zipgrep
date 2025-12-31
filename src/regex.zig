@@ -232,14 +232,27 @@ pub const Regex = struct {
                 // OPTIMIZATION: For patterns like .*SUFFIX, .* is greedy and will consume
                 // everything from the start up to the suffix. So we only try matchAt(0).
                 // This reduces O(n²) to O(n).
+                //
+                // However, we must ensure the match covers the suffix at lit_pos specifically.
+                // If start_offset > 0, it means a previous match ending earlier failed
+                // (e.g., word boundary check), so we need a suffix occurrence AFTER start_offset.
+                // The search_pos already ensures lit_pos >= start_offset.
                 if (self.matchAt(input, 0)) |end| {
+                    // Match must extend to cover this specific suffix occurrence
                     if (end >= lit_pos + suffix.len) {
+                        // IMPORTANT: For word boundary checks to work correctly, we return
+                        // a match ending at THIS specific suffix occurrence, not the greedy
+                        // longest match. This allows the word boundary check to validate
+                        // the boundary at this suffix, and if it fails, we can try the next
+                        // suffix occurrence.
                         return matcher_mod.MatchResult{
                             .start = 0,
-                            .end = end,
+                            .end = lit_pos + suffix.len,
                         };
                     }
                 }
+                // If matchAt(0) doesn't reach this suffix, no point trying - .* is greedy
+                // and will always match the same way from position 0. Move to next suffix.
             } else {
                 // For other patterns, try all positions from 0 to lit_pos
                 // (or from start_offset if resuming)
