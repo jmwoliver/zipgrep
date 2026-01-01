@@ -100,9 +100,33 @@ pub const Matcher = struct {
         return before_ok and after_ok;
     }
 
-    /// Check if a character is a "word" character (alphanumeric or underscore)
+    /// Check if a character is a "word" character for word boundary matching.
+    /// Uses a simple heuristic: ASCII alphanumeric, underscore, or any non-ASCII byte.
+    ///
+    /// This treats all UTF-8 multibyte sequences as word characters, which correctly
+    /// handles CJK ideographs (Chinese, Japanese kanji, Korean hanja) but has a known
+    /// limitation: CJK punctuation marks are also treated as word characters.
+    ///
+    /// Edge case - these CJK punctuation chars will NOT create word boundaries (unlike ripgrep):
+    ///   U+3001 、 (ideographic comma)
+    ///   U+3002 。 (ideographic full stop)
+    ///   U+3000   (ideographic space)
+    ///   U+300C 「 (left corner bracket)
+    ///   U+300D 」 (right corner bracket)
+    ///   U+300A 《 (left double angle bracket)
+    ///   U+300B 》 (right double angle bracket)
+    ///   U+30FB ・ (katakana middle dot)
+    ///   U+FF0C ， (fullwidth comma)
+    ///   U+FF0E ． (fullwidth full stop)
+    ///   U+FF1A ： (fullwidth colon)
+    ///   U+FF1B ； (fullwidth semicolon)
+    ///
+    /// For full Unicode-aware word boundaries matching ripgrep, we would need
+    /// Unicode property tables (~100KB) to check \p{Alphabetic}, \p{M}, \p{Pc}, etc.
     fn isWordChar(c: u8) bool {
-        return std.ascii.isAlphanumeric(c) or c == '_';
+        // UTF-8 bytes >= 0x80 are part of multibyte characters.
+        // Treat them as word characters to handle CJK ideographs correctly.
+        return c >= 0x80 or std.ascii.isAlphanumeric(c) or c == '_';
     }
 
     /// Check if the haystack contains a match
@@ -478,5 +502,59 @@ test "word boundary .* pattern skips early non-boundary to find later valid matc
     // Should find match ending at "c_cache" (position 25) - the first with valid word boundary
     try std.testing.expectEqual(@as(usize, 0), result.?.start);
     try std.testing.expectEqual(@as(usize, 25), result.?.end);
+}
+
+test "word boundary with CJK ideographs" {
+    const allocator = std.testing.allocator;
+
+    var m = try Matcher.init(allocator, "cache", false, true);
+    defer m.deinit();
+
+    // CJK ideographs are word characters - should NOT match when surrounded by Chinese
+    try std.testing.expect(!m.matches("硬件cache更小")); // Chinese: "hardware cache smaller"
+    try std.testing.expect(!m.matches("硬件cache")); // cache at end after Chinese
+    try std.testing.expect(!m.matches("cache更小")); // cache at start before Chinese
+
+    // Japanese hiragana - should NOT match
+    try std.testing.expect(!m.matches("あcacheい"));
+
+    // But should match when there's whitespace
+    try std.testing.expect(m.matches("硬件 cache 更小"));
+    try std.testing.expect(m.matches("硬件 cache"));
+    try std.testing.expect(m.matches("cache 更小"));
+}
+
+test "word boundary with CJK punctuation - known edge case" {
+    const allocator = std.testing.allocator;
+
+    var m = try Matcher.init(allocator, "cache", false, true);
+    defer m.deinit();
+
+    // KNOWN LIMITATION: CJK punctuation is treated as word characters with our simple heuristic.
+    // ripgrep would match these (punctuation = word boundary), but we won't.
+    // This is documented as an acceptable trade-off for simplicity.
+    //
+    // These tests document the current (imperfect) behavior:
+    try std.testing.expect(!m.matches("test、cache")); // ideographic comma U+3001
+    try std.testing.expect(!m.matches("test。cache")); // ideographic full stop U+3002
+    try std.testing.expect(!m.matches("test「cache")); // left corner bracket U+300C
+    try std.testing.expect(!m.matches("test，cache")); // fullwidth comma U+FF0C
+    try std.testing.expect(!m.matches("test：cache")); // fullwidth colon U+FF1A
+
+    // ASCII punctuation still works correctly
+    try std.testing.expect(m.matches("test,cache")); // ASCII comma - DOES match
+    try std.testing.expect(m.matches("test.cache")); // ASCII period - DOES match
+}
+
+test "word boundary with mixed ASCII and UTF-8" {
+    const allocator = std.testing.allocator;
+
+    var m = try Matcher.init(allocator, "foo", false, true);
+    defer m.deinit();
+
+    // UTF-8 continuation bytes should be treated as word chars
+    // This prevents false matches when ASCII appears inside multibyte sequences
+    try std.testing.expect(!m.matches("日foo本")); // Japanese: should NOT match
+    try std.testing.expect(m.matches("日 foo 本")); // With spaces: should match
 }
 
