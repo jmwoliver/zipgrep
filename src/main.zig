@@ -29,6 +29,8 @@ pub const Config = struct {
     color: ColorMode = .auto,
     heading: HeadingMode = .auto,
     glob_patterns: []const GlobPattern = &.{},
+    /// True if searching a single file or stdin (computed once to avoid repeated stat calls)
+    is_single_source: bool = false,
 
     pub fn getNumThreads(self: Config) usize {
         if (self.num_threads) |n| return n;
@@ -205,6 +207,13 @@ pub fn parseArgsFromSlice(allocator: std.mem.Allocator, args: []const []const u8
     config.paths = try paths.toOwnedSlice(allocator);
     config.glob_patterns = try glob_patterns.toOwnedSlice(allocator);
 
+    // Compute is_single_source once (avoid repeated stat calls in output formatting)
+    config.is_single_source = config.paths.len == 1 and blk: {
+        if (std.mem.eql(u8, config.paths[0], "-")) break :blk true;
+        const stat = std.fs.cwd().statFile(config.paths[0]) catch break :blk true;
+        break :blk stat.kind != .directory;
+    };
+
     return config;
 }
 
@@ -288,16 +297,8 @@ fn run(allocator: std.mem.Allocator, config: Config) !void {
     try w.walk();
 
     // Print final stats if counting (skip for single file/stdin - already printed)
-    if (config.count_only) {
-        // Only print total if we have multiple sources (directory or multiple paths)
-        const is_single_source = config.paths.len == 1 and
-            (std.mem.eql(u8, config.paths[0], "-") or blk: {
-                const stat = std.fs.cwd().statFile(config.paths[0]) catch break :blk false;
-                break :blk stat.kind != .directory;
-            });
-        if (!is_single_source) {
-            try out.printTotalCount();
-        }
+    if (config.count_only and !config.is_single_source) {
+        try out.printTotalCount();
     }
 }
 

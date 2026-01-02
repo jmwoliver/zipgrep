@@ -190,13 +190,37 @@ pub const Walker = struct {
         return self.searchFileWithAlloc(path, self.allocator);
     }
 
+    /// Query available bytes in stdin using FIONREAD ioctl for pre-allocation hint
+    fn getStdinSizeHint(file: std.fs.File) usize {
+        const builtin = @import("builtin");
+        const FIONREAD: u32 = switch (builtin.os.tag) {
+            .macos, .ios, .tvos, .watchos => 0x4004667f,
+            .linux => 0x541B,
+            .freebsd, .netbsd, .openbsd, .dragonfly => 0x4004667f,
+            else => return 0, // Unsupported platform
+        };
+
+        var bytes_available: c_int = 0;
+        const rc = std.posix.system.ioctl(file.handle, FIONREAD, @as(usize, @intFromPtr(&bytes_available)));
+        if (rc == 0 and bytes_available > 0) {
+            return @intCast(bytes_available);
+        }
+        return 0;
+    }
+
     /// Search stdin for matches
     fn searchStdin(self: *Walker) !void {
         const stdin = std.fs.File.stdin();
 
-        // Read all stdin into buffer in chunks
+        // Read all stdin into buffer
         var content: std.ArrayList(u8) = .empty;
         defer content.deinit(self.allocator);
+
+        // Pre-allocate based on FIONREAD hint to reduce reallocations
+        const hint = getStdinSizeHint(stdin);
+        if (hint > 0) {
+            content.ensureTotalCapacity(self.allocator, hint) catch {};
+        }
 
         var read_buf: [64 * 1024]u8 = undefined;
         while (true) {

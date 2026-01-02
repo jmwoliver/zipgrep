@@ -42,13 +42,9 @@ pub const FileBuffer = struct {
     show_line_numbers: bool,
 
     pub fn init(allocator: std.mem.Allocator, config: main.Config, use_color: bool, use_heading: bool) FileBuffer {
-        // Determine if this is a single source (stdin or single explicit file)
-        const is_single_source = config.paths.len == 1 and
-            (std.mem.eql(u8, config.paths[0], "-") or !isDirectory(config.paths[0]));
-
         // Resolve line_number setting
         // Only show line numbers in auto mode for multi-source TTY output
-        const show_line_numbers = config.showLineNumbers(use_color, !is_single_source);
+        const show_line_numbers = config.showLineNumbers(use_color, !config.is_single_source);
 
         return .{
             .buffer = .{},
@@ -58,14 +54,9 @@ pub const FileBuffer = struct {
             .use_color = use_color,
             .use_heading = use_heading,
             .file_path = null,
-            .skip_filename = is_single_source,
+            .skip_filename = config.is_single_source,
             .show_line_numbers = show_line_numbers,
         };
-    }
-
-    fn isDirectory(path: []const u8) bool {
-        const stat = std.fs.cwd().statFile(path) catch return false;
-        return stat.kind == .directory;
     }
 
     pub fn deinit(self: *FileBuffer) void {
@@ -287,14 +278,10 @@ pub const Output = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Check if we should skip filename (single stdin or single explicit file)
-        const skip_filename = self.config.paths.len == 1 and
-            (std.mem.eql(u8, self.config.paths[0], "-") or !isDirectory(self.config.paths[0]));
-
         var buf: [4096]u8 = undefined;
         var writer = self.file.writer(&buf);
 
-        if (skip_filename) {
+        if (self.config.is_single_source) {
             // Single source - just print the count
             if (self.use_color) {
                 try writer.interface.print("{s}{d}{s}\n", .{ Color.line_num, count, Color.reset });
@@ -317,11 +304,6 @@ pub const Output = struct {
         }
         try writer.interface.flush();
         _ = self.total_count.fetchAdd(count, .monotonic);
-    }
-
-    fn isDirectory(path: []const u8) bool {
-        const stat = std.fs.cwd().statFile(path) catch return false;
-        return stat.kind == .directory;
     }
 
     pub fn printTotalCount(self: *Output) !void {
