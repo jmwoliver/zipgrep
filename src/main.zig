@@ -18,7 +18,7 @@ pub const Config = struct {
     pattern: []const u8,
     paths: []const []const u8,
     ignore_case: bool = false,
-    line_number: bool = true,
+    line_number: ?bool = null, // null = auto (true for TTY, false for pipe)
     count_only: bool = false,
     files_with_matches: bool = false,
     no_ignore: bool = false,
@@ -36,6 +36,16 @@ pub const Config = struct {
         // from excessive thread wake/sleep cycles on high core count systems
         const cpus = std.Thread.getCpuCount() catch 4;
         return @min(cpus, 8);
+    }
+
+    /// Get effective line_number setting (auto = TTY and multi-source dependent)
+    /// Only show line numbers in auto mode when stdout is TTY AND
+    /// searching multiple files (directory or multiple paths)
+    pub fn showLineNumbers(self: Config, stdout_is_tty: bool, is_multi_source: bool) bool {
+        if (self.line_number) |explicit| return explicit;
+        // Auto mode: show line numbers only for TTY AND multi-source searches
+        // Single file/stdin: no line numbers
+        return stdout_is_tty and is_multi_source;
     }
 };
 
@@ -90,7 +100,8 @@ pub fn parseArgsFromSlice(allocator: std.mem.Allocator, args: []const []const u8
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.startsWith(u8, arg, "-")) {
+        if (std.mem.startsWith(u8, arg, "-") and !std.mem.eql(u8, arg, "-")) {
+            // Flag argument (but "-" alone means stdin, not a flag)
             if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
                 printHelp();
                 return error.HelpRequested;
@@ -182,7 +193,13 @@ pub fn parseArgsFromSlice(allocator: std.mem.Allocator, args: []const []const u8
     config.pattern = pattern.?;
 
     if (paths.items.len == 0) {
-        try paths.append(allocator, ".");
+        // Auto-detect: if stdin is piped (not TTY), read from stdin; otherwise search current directory
+        const stdin = std.fs.File.stdin();
+        if (!stdin.isTty()) {
+            try paths.append(allocator, "-"); // stdin mode
+        } else {
+            try paths.append(allocator, "."); // current directory
+        }
     }
 
     config.paths = try paths.toOwnedSlice(allocator);
@@ -201,11 +218,12 @@ fn printHelp() void {
         \\ARGS:
         \\    PATTERN    The pattern to search for (literal or regex)
         \\    PATH       Files or directories to search (default: current directory)
+        \\               Use '-' to read from standard input
         \\
         \\OPTIONS:
         \\    -h, --help              Show this help message
         \\    -i, --ignore-case       Case insensitive search
-        \\    -n, --line-number       Show line numbers (default: on)
+        \\    -n, --line-number       Show line numbers (default: on for TTY, off for pipes)
         \\    -c, --count             Only show count of matching lines
         \\    -l, --files-with-matches Only show filenames with matches
         \\    -w, --word-regexp       Only match whole words
@@ -218,6 +236,10 @@ fn printHelp() void {
         \\    --heading               Group matches by file with headers (default for TTY)
         \\    --no-heading            Print file:line:content format (default for pipes)
         \\
+        \\STDIN:
+        \\    When no paths are specified and input is piped, zg reads from stdin.
+        \\    Use '-' explicitly to read stdin alongside files: zg PATTERN - file.txt
+        \\
         \\EXAMPLES:
         \\    zg "TODO" src/
         \\    zg -i "error" *.log
@@ -225,6 +247,9 @@ fn printHelp() void {
         \\    zg "fn main" -g '*.zig'
         \\    zg "import" -g '*.zig' -g '!*_test.zig'
         \\    zg "TODO" -g '!vendor/'
+        \\    cat file.txt | zg "pattern"
+        \\    echo "hello world" | zg -n "hello"
+        \\    zg "pattern" - src/
         \\
     ;
     std.debug.print("{s}", .{help});
@@ -262,9 +287,17 @@ fn run(allocator: std.mem.Allocator, config: Config) !void {
 
     try w.walk();
 
-    // Print final stats if counting
+    // Print final stats if counting (skip for single file/stdin - already printed)
     if (config.count_only) {
-        try out.printTotalCount();
+        // Only print total if we have multiple sources (directory or multiple paths)
+        const is_single_source = config.paths.len == 1 and
+            (std.mem.eql(u8, config.paths[0], "-") or blk: {
+                const stat = std.fs.cwd().statFile(config.paths[0]) catch break :blk false;
+                break :blk stat.kind != .directory;
+            });
+        if (!is_single_source) {
+            try out.printTotalCount();
+        }
     }
 }
 
@@ -277,7 +310,9 @@ test "parseArgs pattern only" {
 
     try std.testing.expectEqualStrings("searchterm", config.pattern);
     try std.testing.expectEqual(@as(usize, 1), config.paths.len);
-    try std.testing.expectEqualStrings(".", config.paths[0]); // Default path
+    // Default path is "." (TTY) or "-" (piped stdin) depending on how test is run
+    const valid_default = std.mem.eql(u8, config.paths[0], ".") or std.mem.eql(u8, config.paths[0], "-");
+    try std.testing.expect(valid_default);
 }
 
 test "parseArgs pattern and path" {

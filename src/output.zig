@@ -36,8 +36,20 @@ pub const FileBuffer = struct {
     use_color: bool,
     use_heading: bool,
     file_path: ?[]const u8,
+    /// Skip filename prefix (for single stdin/file searches)
+    skip_filename: bool,
+    /// Resolved line number setting (accounts for TTY auto-detection)
+    show_line_numbers: bool,
 
     pub fn init(allocator: std.mem.Allocator, config: main.Config, use_color: bool, use_heading: bool) FileBuffer {
+        // Determine if this is a single source (stdin or single explicit file)
+        const is_single_source = config.paths.len == 1 and
+            (std.mem.eql(u8, config.paths[0], "-") or !isDirectory(config.paths[0]));
+
+        // Resolve line_number setting
+        // Only show line numbers in auto mode for multi-source TTY output
+        const show_line_numbers = config.showLineNumbers(use_color, !is_single_source);
+
         return .{
             .buffer = .{},
             .allocator = allocator,
@@ -46,13 +58,19 @@ pub const FileBuffer = struct {
             .use_color = use_color,
             .use_heading = use_heading,
             .file_path = null,
+            .skip_filename = is_single_source,
+            .show_line_numbers = show_line_numbers,
         };
+    }
+
+    fn isDirectory(path: []const u8) bool {
+        const stat = std.fs.cwd().statFile(path) catch return false;
+        return stat.kind == .directory;
     }
 
     pub fn deinit(self: *FileBuffer) void {
         self.buffer.deinit(self.allocator);
     }
-
 
     pub fn addMatch(self: *FileBuffer, match_data: Match) !void {
         const writer = self.buffer.writer(self.allocator);
@@ -66,13 +84,15 @@ pub const FileBuffer = struct {
             // filepath2
             // ...
 
-            // Print file header on first match
+            // Print file header on first match (skip for single stdin/file)
             if (self.match_count == 0) {
                 self.file_path = match_data.file_path;
-                if (self.use_color) {
-                    try writer.print("{s}{s}{s}\n", .{ Color.path, match_data.file_path, Color.reset });
-                } else {
-                    try writer.print("{s}\n", .{match_data.file_path});
+                if (!self.skip_filename) {
+                    if (self.use_color) {
+                        try writer.print("{s}{s}{s}\n", .{ Color.path, match_data.file_path, Color.reset });
+                    } else {
+                        try writer.print("{s}\n", .{match_data.file_path});
+                    }
                 }
             }
 
@@ -84,7 +104,7 @@ pub const FileBuffer = struct {
             }
 
             // Print line with colored match
-            if (self.config.line_number) {
+            if (self.show_line_numbers) {
                 if (self.use_color) {
                     try writer.print("{s}{d}{s}{s}:{s}", .{
                         Color.line_num,
@@ -121,7 +141,7 @@ pub const FileBuffer = struct {
             self.match_count += 1;
 
             if (self.config.files_with_matches) {
-                // Just print the filename
+                // Just print the filename (always, even for single stdin)
                 if (self.use_color) {
                     try writer.print("{s}{s}{s}\n", .{ Color.path, match_data.file_path, Color.reset });
                 } else {
@@ -130,21 +150,23 @@ pub const FileBuffer = struct {
                 return;
             }
 
-            // Print file path prefix
-            if (self.use_color) {
-                try writer.print("{s}{s}{s}{s}:{s}", .{
-                    Color.path,
-                    match_data.file_path,
-                    Color.reset,
-                    Color.separator,
-                    Color.reset,
-                });
-            } else {
-                try writer.print("{s}:", .{match_data.file_path});
+            // Print file path prefix (skip for single stdin/file)
+            if (!self.skip_filename) {
+                if (self.use_color) {
+                    try writer.print("{s}{s}{s}{s}:{s}", .{
+                        Color.path,
+                        match_data.file_path,
+                        Color.reset,
+                        Color.separator,
+                        Color.reset,
+                    });
+                } else {
+                    try writer.print("{s}:", .{match_data.file_path});
+                }
             }
 
             // Print line number if enabled
-            if (self.config.line_number) {
+            if (self.show_line_numbers) {
                 if (self.use_color) {
                     try writer.print("{s}{d}{s}{s}:{s}", .{
                         Color.line_num,
@@ -209,7 +231,7 @@ pub const Output = struct {
         };
 
         // Determine heading mode based on config and TTY status
-        // Like ripgrep: use headings when outputting to TTY, flat format when piped
+        // Use headings when outputting to TTY, flat format when piped
         const use_heading = switch (config.heading) {
             .always => true,
             .never => false,
@@ -261,15 +283,25 @@ pub const Output = struct {
         }
     }
 
-
     pub fn printFileCount(self: *Output, file_path: []const u8, count: usize) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        // Check if we should skip filename (single stdin or single explicit file)
+        const skip_filename = self.config.paths.len == 1 and
+            (std.mem.eql(u8, self.config.paths[0], "-") or !isDirectory(self.config.paths[0]));
+
         var buf: [4096]u8 = undefined;
         var writer = self.file.writer(&buf);
 
-        if (self.use_color) {
+        if (skip_filename) {
+            // Single source - just print the count
+            if (self.use_color) {
+                try writer.interface.print("{s}{d}{s}\n", .{ Color.line_num, count, Color.reset });
+            } else {
+                try writer.interface.print("{d}\n", .{count});
+            }
+        } else if (self.use_color) {
             try writer.interface.print("{s}{s}{s}{s}:{s}{s}{d}{s}\n", .{
                 Color.path,
                 file_path,
@@ -285,6 +317,11 @@ pub const Output = struct {
         }
         try writer.interface.flush();
         _ = self.total_count.fetchAdd(count, .monotonic);
+    }
+
+    fn isDirectory(path: []const u8) bool {
+        const stat = std.fs.cwd().statFile(path) catch return false;
+        return stat.kind == .directory;
     }
 
     pub fn printTotalCount(self: *Output) !void {
@@ -321,7 +358,7 @@ test "FileBuffer addMatch flat no color" {
     const config = main.Config{
         .pattern = "test",
         .paths = &[_][]const u8{"."},
-        .line_number = true,
+        .line_number = true, // explicit true
     };
 
     var buf = FileBuffer.init(allocator, config, false, false); // no color, no heading
@@ -350,7 +387,7 @@ test "FileBuffer addMatch heading no color" {
     const config = main.Config{
         .pattern = "test",
         .paths = &[_][]const u8{"."},
-        .line_number = true,
+        .line_number = true, // explicit true
     };
 
     var buf = FileBuffer.init(allocator, config, false, true); // no color, heading mode
@@ -429,7 +466,7 @@ test "FileBuffer addMatch with color" {
     const config = main.Config{
         .pattern = "test",
         .paths = &[_][]const u8{"."},
-        .line_number = true,
+        .line_number = true, // explicit true
     };
 
     var buf = FileBuffer.init(allocator, config, true, false); // color enabled
@@ -466,7 +503,7 @@ test "FileBuffer no line number" {
     const config = main.Config{
         .pattern = "test",
         .paths = &[_][]const u8{"."},
-        .line_number = false,
+        .line_number = false, // explicit false
     };
 
     var buf = FileBuffer.init(allocator, config, false, false);

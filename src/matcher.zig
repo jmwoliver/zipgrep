@@ -107,7 +107,7 @@ pub const Matcher = struct {
     /// handles CJK ideographs (Chinese, Japanese kanji, Korean hanja) but has a known
     /// limitation: CJK punctuation marks are also treated as word characters.
     ///
-    /// Edge case - these CJK punctuation chars will NOT create word boundaries (unlike ripgrep):
+    /// Edge case - these CJK punctuation chars will NOT create word boundaries:
     ///   U+3001 、 (ideographic comma)
     ///   U+3002 。 (ideographic full stop)
     ///   U+3000   (ideographic space)
@@ -121,7 +121,7 @@ pub const Matcher = struct {
     ///   U+FF1A ： (fullwidth colon)
     ///   U+FF1B ； (fullwidth semicolon)
     ///
-    /// For full Unicode-aware word boundaries matching ripgrep, we would need
+    /// For full Unicode-aware word boundaries, we would need
     /// Unicode property tables (~100KB) to check \p{Alphabetic}, \p{M}, \p{Pc}, etc.
     fn isWordChar(c: u8) bool {
         // UTF-8 bytes >= 0x80 are part of multibyte characters.
@@ -531,7 +531,7 @@ test "word boundary with CJK punctuation - known edge case" {
     defer m.deinit();
 
     // KNOWN LIMITATION: CJK punctuation is treated as word characters with our simple heuristic.
-    // ripgrep would match these (punctuation = word boundary), but we won't.
+    // Full Unicode support would match these (punctuation = word boundary), but we won't.
     // This is documented as an acceptable trade-off for simplicity.
     //
     // These tests document the current (imperfect) behavior:
@@ -557,4 +557,3 @@ test "word boundary with mixed ASCII and UTF-8" {
     try std.testing.expect(!m.matches("日foo本")); // Japanese: should NOT match
     try std.testing.expect(m.matches("日 foo 本")); // With spaces: should match
 }
-

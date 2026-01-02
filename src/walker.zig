@@ -76,9 +76,18 @@ pub const Walker = struct {
             files.deinit(self.allocator);
         }
 
+        // Track if we need to process stdin (do it AFTER files)
+        var has_stdin = false;
+
         // Collect files from all paths
         // Note: Root .gitignore is already loaded in walk() before calling this
         for (self.config.paths) |path| {
+            // Skip stdin - process after files
+            if (std.mem.eql(u8, path, "-")) {
+                has_stdin = true;
+                continue;
+            }
+
             const stat = std.fs.cwd().statFile(path) catch continue;
             if (stat.kind == .directory) {
                 try self.collectFiles(path, 0, &files);
@@ -100,6 +109,11 @@ pub const Walker = struct {
         // Now search files
         for (files.items) |file_path| {
             self.searchFile(file_path) catch {};
+        }
+
+        // Process stdin AFTER files (so file output appears before blocking on stdin)
+        if (has_stdin) {
+            try self.searchStdin();
         }
     }
 
@@ -172,15 +186,70 @@ pub const Walker = struct {
         }
     }
 
-
-
-
     fn searchFile(self: *Walker, path: []const u8) !void {
         return self.searchFileWithAlloc(path, self.allocator);
     }
 
+    /// Search stdin for matches
+    fn searchStdin(self: *Walker) !void {
+        const stdin = std.fs.File.stdin();
+
+        // Read all stdin into buffer in chunks
+        var content: std.ArrayList(u8) = .empty;
+        defer content.deinit(self.allocator);
+
+        var read_buf: [64 * 1024]u8 = undefined;
+        while (true) {
+            const bytes_read = stdin.read(&read_buf) catch break;
+            if (bytes_read == 0) break;
+            content.appendSlice(self.allocator, read_buf[0..bytes_read]) catch break;
+        }
+
+        const data = content.items;
+        if (data.len == 0) return;
+
+        // Binary detection: check first 8KB for NUL bytes
+        const check_len = @min(data.len, 8192);
+        for (data[0..check_len]) |byte| {
+            if (byte == 0) return; // Skip binary input
+        }
+
+        // Use FileBuffer with "<stdin>" as path
+        var file_buf = output.FileBuffer.init(self.allocator, self.config, self.out.colorEnabled(), self.out.headingEnabled());
+        defer file_buf.deinit();
+
+        var line_iter = reader.LineIterator.init(data);
+
+        while (line_iter.next()) |line| {
+            if (self.pattern_matcher.findFirst(line.content)) |match_result| {
+                if (self.config.count_only) {
+                    file_buf.match_count += 1;
+                } else {
+                    try file_buf.addMatch(.{
+                        .file_path = "<stdin>",
+                        .line_number = line.number,
+                        .line_content = line.content,
+                        .match_start = match_result.start,
+                        .match_end = match_result.end,
+                    });
+
+                    if (self.config.files_with_matches) break;
+                }
+            }
+        }
+
+        // Flush all buffered output
+        if (self.config.count_only) {
+            if (file_buf.match_count > 0) {
+                try self.out.printFileCount("<stdin>", file_buf.match_count);
+            }
+        } else {
+            try self.out.flushFileBuffer(&file_buf);
+        }
+    }
+
     fn searchFileWithAlloc(self: *Walker, path: []const u8, alloc: std.mem.Allocator) !void {
-        // Skip .gitignore files (ripgrep doesn't search inside them by default)
+        // Skip .gitignore files
         if (std.mem.endsWith(u8, path, ".gitignore")) return;
 
         var content = reader.readFile(alloc, path, true) catch return;

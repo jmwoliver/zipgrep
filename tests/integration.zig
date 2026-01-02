@@ -98,8 +98,8 @@ test "integration: count mode" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    // Should output count in format "file:count"
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "sample.txt") != null);
+    // Single file count mode: should output just count (no filename)
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "1") != null);
 }
 
 test "integration: files only mode" {
@@ -222,18 +222,22 @@ test "integration: regex pattern with plus" {
 test "integration: no-heading format" {
     const allocator = std.testing.allocator;
 
-    const result = try runZipgrep(allocator, &.{ "--no-heading", "PATTERN", "tests/fixtures/sample.txt" });
+    // Use directory to test --no-heading (single file doesn't show filename prefix)
+    const result = try runZipgrep(allocator, &.{ "--no-heading", "PATTERN", "tests/fixtures/" });
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    // Should be in flat format: file:line:content
-    // Each line should contain the file path
+    // Should be in flat format: file:content (no line numbers by default)
+    // Each line should contain a file path
     var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    var found_sample = false;
     while (lines.next()) |line| {
         if (line.len > 0) {
-            try std.testing.expect(std.mem.indexOf(u8, line, "sample.txt:") != null);
+            // Should have filename prefix for directory search
+            if (std.mem.indexOf(u8, line, "sample.txt:") != null) found_sample = true;
         }
     }
+    try std.testing.expect(found_sample);
 }
 
 test "integration: binary files skipped" {
@@ -554,4 +558,179 @@ test "integration: word boundary .* match at end of line" {
     // Should find a match (last _suffix is at word boundary - end of line)
     try std.testing.expect(result.stdout.len > 0);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+// ============================================================================
+// Stdin support tests
+// ============================================================================
+
+/// Helper to run zg with stdin input
+fn runZipgrepWithStdin(allocator: std.mem.Allocator, args: []const []const u8, stdin_input: []const u8) !Result {
+    const exe_path = "zig-out/bin/zg";
+
+    var argv = std.ArrayListUnmanaged([]const u8){};
+    defer argv.deinit(allocator);
+
+    try argv.append(allocator, exe_path);
+    for (args) |arg| {
+        try argv.append(allocator, arg);
+    }
+
+    var child = std.process.Child.init(argv.items, allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    try child.spawn();
+
+    // Write stdin input and close
+    if (child.stdin) |stdin| {
+        try stdin.writeAll(stdin_input);
+        stdin.close();
+    }
+    child.stdin = null;
+
+    // Use collectOutput with ArrayList outputs (Zig 0.15 style)
+    var stdout_list: std.ArrayList(u8) = .empty;
+    defer stdout_list.deinit(allocator);
+    var stderr_list: std.ArrayList(u8) = .empty;
+    defer stderr_list.deinit(allocator);
+
+    try child.collectOutput(allocator, &stdout_list, &stderr_list, 1024 * 1024);
+
+    const term = try child.wait();
+    const exit_code: u8 = switch (term) {
+        .Exited => |code| code,
+        else => 255,
+    };
+
+    return .{
+        .stdout = try stdout_list.toOwnedSlice(allocator),
+        .stderr = try stderr_list.toOwnedSlice(allocator),
+        .exit_code = exit_code,
+    };
+}
+
+test "integration: stdin basic search" {
+    const allocator = std.testing.allocator;
+
+    const result = try runZipgrepWithStdin(allocator, &.{"hello"}, "hello world\n");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Should find "hello world" with line number
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "hello world") != null);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "integration: stdin multiline" {
+    const allocator = std.testing.allocator;
+
+    const result = try runZipgrepWithStdin(allocator, &.{"hello"}, "line one\nline two hello\nline three\n");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Should find the line containing hello (no line number by default)
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "line two hello") != null);
+}
+
+test "integration: stdin multiline with line numbers" {
+    const allocator = std.testing.allocator;
+
+    const result = try runZipgrepWithStdin(allocator, &.{ "-n", "hello" }, "line one\nline two hello\nline three\n");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // With -n flag, should show line number prefix
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "2:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "hello") != null);
+}
+
+test "integration: stdin count mode" {
+    const allocator = std.testing.allocator;
+
+    const result = try runZipgrepWithStdin(allocator, &.{ "-c", "hello" }, "hello one\nhello two\ngoodbye\n");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Should output just "2" (no filename prefix for single stdin)
+    try std.testing.expectEqualStrings("2\n", result.stdout);
+}
+
+test "integration: stdin files-with-matches" {
+    const allocator = std.testing.allocator;
+
+    const result = try runZipgrepWithStdin(allocator, &.{ "-l", "hello" }, "hello world\n");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Should output "<stdin>"
+    try std.testing.expectEqualStrings("<stdin>\n", result.stdout);
+}
+
+test "integration: stdin case insensitive" {
+    const allocator = std.testing.allocator;
+
+    const result = try runZipgrepWithStdin(allocator, &.{ "-i", "hello" }, "HELLO WORLD\n");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "HELLO") != null);
+}
+
+test "integration: stdin word boundary" {
+    const allocator = std.testing.allocator;
+
+    const result = try runZipgrepWithStdin(allocator, &.{ "-w", "hello" }, "helloworld hello world\n");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Should find "hello" as whole word
+    try std.testing.expect(result.stdout.len > 0);
+}
+
+test "integration: stdin no matches" {
+    const allocator = std.testing.allocator;
+
+    const result = try runZipgrepWithStdin(allocator, &.{"xyz"}, "hello world\n");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Should have empty output
+    try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
+}
+
+test "integration: stdin empty input" {
+    const allocator = std.testing.allocator;
+
+    const result = try runZipgrepWithStdin(allocator, &.{"hello"}, "");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Should handle gracefully with no output
+    try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
+}
+
+test "integration: stdin explicit dash" {
+    const allocator = std.testing.allocator;
+
+    // Use explicit - as path argument
+    const result = try runZipgrepWithStdin(allocator, &.{ "hello", "-" }, "hello from stdin\n");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "hello") != null);
+}
+
+test "integration: stdin with file" {
+    const allocator = std.testing.allocator;
+
+    // Search both stdin and a file
+    const result = try runZipgrepWithStdin(allocator, &.{ "--no-heading", "PATTERN", "-", "tests/fixtures/sample.txt" }, "PATTERN from stdin\n");
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Should find matches in both stdin and file
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "<stdin>:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "sample.txt:") != null);
 }
