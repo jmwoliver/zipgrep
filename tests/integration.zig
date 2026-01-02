@@ -734,3 +734,98 @@ test "integration: stdin with file" {
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "<stdin>:") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "sample.txt:") != null);
 }
+
+// ============================================================================
+// Parent .gitignore traversal tests (tests for commit 90d71cb fix)
+// ============================================================================
+
+test "integration: parent gitignore from root respects root gitignore" {
+    const allocator = std.testing.allocator;
+
+    // Search from root of nested_gitignore fixture
+    const result = try runZipgrep(allocator, &.{ "PATTERN", "tests/fixtures/nested_gitignore/" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Should find non-ignored files
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "root_file.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "sub_file.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "deep_file.txt") != null);
+
+    // Should NOT find files matching *.root_ignored (from root .gitignore)
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, ".root_ignored") == null);
+
+    // Should NOT find files matching *.sub_ignored (from subdir .gitignore)
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, ".sub_ignored") == null);
+}
+
+test "integration: parent gitignore from subdir respects parent gitignore" {
+    // This is the main test for the fix in commit 90d71cb
+    // When searching a subdirectory, parent .gitignore patterns should apply
+    const allocator = std.testing.allocator;
+
+    // Search from subdir (should still respect root's .gitignore)
+    const result = try runZipgrep(allocator, &.{ "PATTERN", "tests/fixtures/nested_gitignore/subdir/" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Should find non-ignored files in subdir
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "sub_file.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "deep_file.txt") != null);
+
+    // Should NOT find files matching *.root_ignored (from PARENT .gitignore)
+    // This is the key behavior the fix addresses
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "deep_root_ignored.root_ignored") == null);
+
+    // Should NOT find files matching *.sub_ignored (from local .gitignore)
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "sub_ignored.sub_ignored") == null);
+}
+
+test "integration: parent gitignore from deep subdir respects all ancestors" {
+    const allocator = std.testing.allocator;
+
+    // Search from deep/ (should respect both root and subdir .gitignore)
+    const result = try runZipgrep(allocator, &.{ "PATTERN", "tests/fixtures/nested_gitignore/subdir/deep/" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Should find non-ignored files
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "deep_file.txt") != null);
+
+    // Should NOT find files matching *.root_ignored (from root .gitignore)
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, ".root_ignored") == null);
+}
+
+test "integration: parent gitignore bypassed with --no-ignore" {
+    const allocator = std.testing.allocator;
+
+    // Search from subdir with --no-ignore (should find ALL files)
+    const result = try runZipgrep(allocator, &.{ "--no-ignore", "PATTERN", "tests/fixtures/nested_gitignore/subdir/" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Should find ALL files including ignored ones
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "sub_file.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "deep_file.txt") != null);
+
+    // With --no-ignore, should find files that would otherwise be ignored
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "deep_root_ignored.root_ignored") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "sub_ignored.sub_ignored") != null);
+}
+
+test "integration: parent gitignore local patterns override parent" {
+    // Test that local .gitignore can override parent patterns
+    // This requires a more complex fixture, so we test the general behavior
+    const allocator = std.testing.allocator;
+
+    // Search from subdir
+    const result = try runZipgrep(allocator, &.{ "PATTERN", "tests/fixtures/nested_gitignore/subdir/" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // Both parent and local patterns should be applied
+    // *.root_ignored from parent
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, ".root_ignored") == null);
+    // *.sub_ignored from local
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, ".sub_ignored") == null);
+}

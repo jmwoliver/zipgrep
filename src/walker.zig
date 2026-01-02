@@ -37,13 +37,22 @@ pub const Walker = struct {
     pub fn walk(self: *Walker) !void {
         const num_threads = self.config.getNumThreads();
 
-        // Load root .gitignore files for all search paths BEFORE starting parallel walk
-        // This ensures that root-level gitignore patterns are available to all workers
-        if (self.ignore_matcher != null) {
+        // Load ancestor .gitignore files for all search paths BEFORE starting walk
+        // This walks up to find the git repository root and loads all .gitignore files
+        // from the repo root down to the search path, ensuring parent patterns apply
+        if (self.ignore_matcher) |im| {
             for (self.config.paths) |path| {
                 const stat = std.fs.cwd().statFile(path) catch continue;
                 if (stat.kind == .directory) {
-                    try self.loadGitignoreForDir(path);
+                    // Find git repository root by walking up from search path
+                    if (gitignore.findGitRoot(self.allocator, path)) |git_root| {
+                        defer self.allocator.free(git_root);
+                        // Load all .gitignore files from git root down to search path
+                        gitignore.loadAncestorGitignores(im, git_root, path, self.allocator);
+                    } else {
+                        // No git root found, just load .gitignore from search path
+                        self.loadGitignoreForDir(path) catch {};
+                    }
                 }
             }
         }
