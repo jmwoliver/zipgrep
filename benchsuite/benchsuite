@@ -1,0 +1,730 @@
+#!/usr/bin/env python3
+"""
+Benchmark suite for comparing zipgrep (zg) against other grep tools.
+Ported from ripgrep's benchsuite with modifications for zipgrep.
+
+Usage:
+    ./benchsuite/benchsuite --download     # Download test corpora
+    ./benchsuite/benchsuite --list         # List available benchmarks
+    ./benchsuite/benchsuite                # Run all benchmarks
+    ./benchsuite/benchsuite linux          # Run benchmarks matching 'linux'
+    ./benchsuite/benchsuite --raw          # Output CSV format
+"""
+
+import argparse
+import csv
+from datetime import datetime
+import gzip
+import io
+import os
+import os.path as path
+import shutil
+import statistics
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+DEFAULT_CACHE_DIR = path.expanduser("~/.cache/zipgrep-bench")
+DEFAULT_RUNS = 10
+DEFAULT_WARMUP = 3
+
+# Corpus URLs
+LINUX_REPO = "https://github.com/BurntSushi/linux.git"
+SUBTITLES_EN_URL = "https://object.pouta.csc.fi/OPUS-OpenSubtitles/v2018/mono/en.txt.gz"
+SUBTITLES_RU_URL = "https://object.pouta.csc.fi/OPUS-OpenSubtitles/v2018/mono/ru.txt.gz"
+
+
+# =============================================================================
+# Exceptions
+# =============================================================================
+
+class MissingCorpus(Exception):
+    """Raised when a required corpus is not available."""
+    pass
+
+
+class MissingCommand(Exception):
+    """Raised when a required command binary is not found."""
+    pass
+
+
+# =============================================================================
+# Core Classes
+# =============================================================================
+
+@dataclass
+class Command:
+    """Represents a command to benchmark."""
+    name: str
+    binary: str
+    args: List[str]
+
+    def exists(self) -> bool:
+        """Check if the command binary exists on the system."""
+        return shutil.which(self.binary) is not None
+
+    def build_cmd(self, pattern: str, path: str) -> List[str]:
+        """Build the full command line."""
+        return [self.binary] + self.args + [pattern, path]
+
+
+@dataclass
+class Result:
+    """Stores benchmark timing results."""
+    name: str
+    command: str
+    times: List[float] = field(default_factory=list)
+
+    def add(self, elapsed: float):
+        self.times.append(elapsed)
+
+    @property
+    def mean(self) -> float:
+        return statistics.mean(self.times) if self.times else 0.0
+
+    @property
+    def stddev(self) -> float:
+        return statistics.stdev(self.times) if len(self.times) > 1 else 0.0
+
+    @property
+    def min(self) -> float:
+        return min(self.times) if self.times else 0.0
+
+    @property
+    def max(self) -> float:
+        return max(self.times) if self.times else 0.0
+
+
+@dataclass
+class Benchmark:
+    """Represents a single benchmark scenario."""
+    name: str
+    pattern: str
+    corpus: str  # 'linux', 'subtitles-en', 'subtitles-ru'
+    commands: List[Command]
+    case_insensitive: bool = False
+    word_boundary: bool = False
+
+    def get_corpus_path(self, cache_dir: str) -> str:
+        """Get the path to the corpus directory/file."""
+        if self.corpus == 'linux':
+            return path.join(cache_dir, 'linux')
+        elif self.corpus == 'subtitles-en':
+            return path.join(cache_dir, 'subtitles-en', 'en.txt')
+        elif self.corpus == 'subtitles-ru':
+            return path.join(cache_dir, 'subtitles-ru', 'ru.txt')
+        else:
+            raise ValueError(f"Unknown corpus: {self.corpus}")
+
+
+# =============================================================================
+# Command Definitions
+# =============================================================================
+
+# Find local zg binary (relative to this script)
+SCRIPT_DIR = path.dirname(path.abspath(__file__))
+PROJECT_ROOT = path.dirname(SCRIPT_DIR)
+LOCAL_ZG = path.join(PROJECT_ROOT, 'zig-out', 'bin', 'zg')
+
+
+def cmd_rg(extra_args: List[str] = None) -> Command:
+    """ripgrep command."""
+    args = ['--no-config', '--color', 'never']
+    if extra_args:
+        args.extend(extra_args)
+    return Command('rg', 'rg', args)
+
+
+def cmd_zg(extra_args: List[str] = None) -> Command:
+    """zipgrep command - uses local build if available."""
+    # Prefer local build over system-installed zg
+    binary = LOCAL_ZG if path.exists(LOCAL_ZG) else 'zg'
+    args = ['--color', 'never']
+    if extra_args:
+        args.extend(extra_args)
+    return Command('zg', binary, args)
+
+
+def cmd_grep(extra_args: List[str] = None) -> Command:
+    """GNU grep command."""
+    args = ['-r', '-n', '--color=never']
+    if extra_args:
+        args.extend(extra_args)
+    return Command('grep', 'grep', args)
+
+
+def cmd_grep_single(extra_args: List[str] = None) -> Command:
+    """GNU grep for single file (no -r)."""
+    args = ['-n', '--color=never']
+    if extra_args:
+        args.extend(extra_args)
+    return Command('grep', 'grep', args)
+
+
+def cmd_ag(extra_args: List[str] = None) -> Command:
+    """The Silver Searcher command."""
+    args = ['--nocolor']
+    if extra_args:
+        args.extend(extra_args)
+    return Command('ag', 'ag', args)
+
+
+def cmd_ugrep(extra_args: List[str] = None) -> Command:
+    """ugrep command."""
+    args = ['--color=never']
+    if extra_args:
+        args.extend(extra_args)
+    return Command('ugrep', 'ugrep', args)
+
+
+# =============================================================================
+# Benchmark Definitions
+# =============================================================================
+
+def get_benchmarks() -> List[Benchmark]:
+    """Return all benchmark definitions."""
+    benchmarks = []
+
+    # -------------------------------------------------------------------------
+    # Linux Kernel Benchmarks
+    # -------------------------------------------------------------------------
+
+    # Literal search
+    benchmarks.append(Benchmark(
+        name='linux_literal',
+        pattern='PM_RESUME',
+        corpus='linux',
+        commands=[
+            cmd_rg(),
+            cmd_zg(),
+            # cmd_grep(),
+            # cmd_ag(),
+            # cmd_ugrep(),
+        ]
+    ))
+
+    # Case-insensitive literal search
+    benchmarks.append(Benchmark(
+        name='linux_literal_casei',
+        pattern='PM_RESUME',
+        corpus='linux',
+        case_insensitive=True,
+        commands=[
+            cmd_rg(['-i']),
+            cmd_zg(['-i']),
+            # cmd_grep(['-i']),
+            # cmd_ag(['-i']),
+            # cmd_ugrep(['-i']),
+        ]
+    ))
+
+    # Word boundary search
+    benchmarks.append(Benchmark(
+        name='linux_word',
+        pattern='PM_RESUME',
+        corpus='linux',
+        word_boundary=True,
+        commands=[
+            cmd_rg(['-w']),
+            cmd_zg(['-w']),
+            # cmd_grep(['-w']),
+            # cmd_ag(['-w']),
+            # cmd_ugrep(['-w']),
+        ]
+    ))
+
+    # Regex with literal suffix
+    benchmarks.append(Benchmark(
+        name='linux_re_suffix',
+        pattern='[A-Z]+_RESUME',
+        corpus='linux',
+        commands=[
+            cmd_rg(),
+            cmd_zg(),
+            # cmd_grep(['-E']),
+            # cmd_ag(),
+            # cmd_ugrep(['-E']),
+        ]
+    ))
+
+    # Alternation
+    benchmarks.append(Benchmark(
+        name='linux_alternates',
+        pattern='ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT',
+        corpus='linux',
+        commands=[
+            cmd_rg(),
+            cmd_zg(),
+            # cmd_grep(['-E']),
+            # cmd_ag(),
+            # cmd_ugrep(['-E']),
+        ]
+    ))
+
+    # Case-insensitive alternation
+    benchmarks.append(Benchmark(
+        name='linux_alternates_casei',
+        pattern='ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT',
+        corpus='linux',
+        case_insensitive=True,
+        commands=[
+            cmd_rg(['-i']),
+            cmd_zg(['-i']),
+            # cmd_grep(['-E', '-i']),
+            # cmd_ag(['-i']),
+            # cmd_ugrep(['-E', '-i']),
+        ]
+    ))
+
+    # Complex regex (no literal optimization possible)
+    # NOTE: Uses \w and \s which are Unicode-aware in rg but ASCII-only in zg
+    # This tests pure regex performance without literal optimizations
+    benchmarks.append(Benchmark(
+        name='linux_no_literal',
+        pattern=r'\w{5}\s+\w{5}\s+\w{5}\s+\w{5}\s+\w{5}',
+        corpus='linux',
+        commands=[
+            cmd_rg(),
+            cmd_zg(),
+            # cmd_grep(['-E']),
+            # cmd_ag(),
+            # cmd_ugrep(['-E']),
+        ]
+    ))
+
+    # -------------------------------------------------------------------------
+    # Subtitles (English) Benchmarks
+    # -------------------------------------------------------------------------
+
+    # Literal search
+    benchmarks.append(Benchmark(
+        name='subtitles_literal',
+        pattern='Sherlock Holmes',
+        corpus='subtitles-en',
+        commands=[
+            cmd_rg(),
+            cmd_zg(),
+            # cmd_grep_single(),
+            # cmd_ag(['--search-files']),
+            # cmd_ugrep(),
+        ]
+    ))
+
+    # Case-insensitive literal
+    benchmarks.append(Benchmark(
+        name='subtitles_literal_casei',
+        pattern='Sherlock Holmes',
+        corpus='subtitles-en',
+        case_insensitive=True,
+        commands=[
+            cmd_rg(['-i']),
+            cmd_zg(['-i']),
+            # cmd_grep_single(['-i']),
+            # cmd_ag(['--search-files', '-i']),
+            # cmd_ugrep(['-i']),
+        ]
+    ))
+
+    # Word boundary
+    benchmarks.append(Benchmark(
+        name='subtitles_word',
+        pattern='Sherlock Holmes',
+        corpus='subtitles-en',
+        word_boundary=True,
+        commands=[
+            cmd_rg(['-w']),
+            cmd_zg(['-w']),
+            # cmd_grep_single(['-w']),
+            # cmd_ag(['--search-files', '-w']),
+            # cmd_ugrep(['-w']),
+        ]
+    ))
+
+    # Alternation
+    benchmarks.append(Benchmark(
+        name='subtitles_alternates',
+        pattern='Sherlock Holmes|John Watson|Professor Moriarty|Mrs. Hudson',
+        corpus='subtitles-en',
+        commands=[
+            cmd_rg(),
+            cmd_zg(),
+            # cmd_grep_single(['-E']),
+            # cmd_ag(['--search-files']),
+            # cmd_ugrep(['-E']),
+        ]
+    ))
+
+    # Complex regex
+    # NOTE: Uses \w and \s which are Unicode-aware in rg but ASCII-only in zg
+    benchmarks.append(Benchmark(
+        name='subtitles_no_literal',
+        pattern=r'\w{5}\s+\w{5}\s+\w{5}',
+        corpus='subtitles-en',
+        commands=[
+            cmd_rg(),
+            cmd_zg(),
+            # cmd_grep_single(['-E']),
+            # cmd_ag(['--search-files']),
+            # cmd_ugrep(['-E']),
+        ]
+    ))
+
+    return benchmarks
+
+
+# =============================================================================
+# Corpus Download Functions
+# =============================================================================
+
+def download_linux(cache_dir: str):
+    """Download the Linux kernel repository."""
+    linux_dir = path.join(cache_dir, 'linux')
+
+    if path.exists(linux_dir):
+        print(f"  Linux kernel already exists at {linux_dir}")
+        return
+
+    print(f"  Cloning Linux kernel (this may take a while)...")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    subprocess.run([
+        'git', 'clone', '--depth', '1',
+        LINUX_REPO, linux_dir
+    ], check=True)
+
+    print(f"  Linux kernel downloaded to {linux_dir}")
+
+
+def download_subtitles(cache_dir: str, lang: str, url: str):
+    """Download and extract a subtitles corpus."""
+    subtitles_dir = path.join(cache_dir, f'subtitles-{lang}')
+    txt_file = path.join(subtitles_dir, f'{lang}.txt')
+
+    if path.exists(txt_file):
+        print(f"  Subtitles ({lang}) already exists at {txt_file}")
+        return
+
+    print(f"  Downloading subtitles ({lang})...")
+    os.makedirs(subtitles_dir, exist_ok=True)
+
+    gz_file = path.join(subtitles_dir, f'{lang}.txt.gz')
+
+    # Download
+    subprocess.run([
+        'curl', '-L', '-o', gz_file, url
+    ], check=True)
+
+    # Extract
+    print(f"  Extracting {gz_file}...")
+    with gzip.open(gz_file, 'rb') as f_in:
+        with open(txt_file, 'wb') as f_out:
+            shutil.copyfileobj(f_in, f_out)
+
+    # Remove compressed file
+    os.remove(gz_file)
+
+    print(f"  Subtitles ({lang}) extracted to {txt_file}")
+
+
+def download_all(cache_dir: str):
+    """Download all corpora."""
+    print(f"Downloading corpora to {cache_dir}")
+    print()
+
+    download_linux(cache_dir)
+    print()
+
+    download_subtitles(cache_dir, 'en', SUBTITLES_EN_URL)
+    print()
+
+    # Russian subtitles are optional (for unicode tests)
+    # download_subtitles(cache_dir, 'ru', SUBTITLES_RU_URL)
+
+    print("Done!")
+
+
+# =============================================================================
+# Benchmark Execution
+# =============================================================================
+
+def run_command(cmd: List[str]) -> float:
+    """Run a command and return the elapsed time in milliseconds."""
+    start = time.perf_counter()
+
+    # Run command, capturing output to /dev/null
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
+    elapsed = time.perf_counter() - start
+    return elapsed * 1000  # Convert to milliseconds
+
+
+def run_benchmark(
+    benchmark: Benchmark,
+    cache_dir: str,
+    runs: int,
+    warmup: int,
+    allow_missing: bool
+) -> List[Result]:
+    """Run a single benchmark and return results for each command."""
+    corpus_path = benchmark.get_corpus_path(cache_dir)
+
+    # Check corpus exists
+    if not path.exists(corpus_path):
+        raise MissingCorpus(
+            f"Corpus not found: {corpus_path}\n"
+            f"Run with --download to fetch corpora."
+        )
+
+    results = []
+
+    for cmd in benchmark.commands:
+        # Check command exists
+        if not cmd.exists():
+            if allow_missing:
+                print(f"    Skipping {cmd.name} (not found)")
+                continue
+            else:
+                raise MissingCommand(
+                    f"Command not found: {cmd.binary}\n"
+                    f"Install it or use --allow-missing to skip."
+                )
+
+        full_cmd = cmd.build_cmd(benchmark.pattern, corpus_path)
+        result = Result(name=benchmark.name, command=cmd.name)
+
+        # Warmup runs
+        for _ in range(warmup):
+            run_command(full_cmd)
+
+        # Timed runs
+        for i in range(runs):
+            elapsed = run_command(full_cmd)
+            result.add(elapsed)
+            print(f"    {cmd.name}: run {i+1}/{runs} = {elapsed:.1f}ms")
+
+        results.append(result)
+
+    return results
+
+
+# =============================================================================
+# Output Formatters
+# =============================================================================
+
+def format_markdown(all_results: Dict[str, List[Result]]) -> str:
+    """Format results as markdown tables."""
+    lines = ["# Benchmark Results", ""]
+
+    for bench_name, results in all_results.items():
+        lines.append(f"## {bench_name}")
+        lines.append("")
+        lines.append("| Tool | Mean (ms) | Stddev | Min | Max |")
+        lines.append("|------|-----------|--------|-----|-----|")
+
+        # Sort by mean time
+        sorted_results = sorted(results, key=lambda r: r.mean)
+
+        for r in sorted_results:
+            lines.append(
+                f"| {r.command} | {r.mean:.1f} | {r.stddev:.1f} | "
+                f"{r.min:.1f} | {r.max:.1f} |"
+            )
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def format_csv(all_results: Dict[str, List[Result]]) -> str:
+    """Format results as CSV."""
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    writer.writerow(['benchmark', 'tool', 'mean_ms', 'stddev_ms', 'min_ms', 'max_ms', 'runs'])
+
+    for bench_name, results in all_results.items():
+        for r in results:
+            writer.writerow([
+                r.name,
+                r.command,
+                f"{r.mean:.2f}",
+                f"{r.stddev:.2f}",
+                f"{r.min:.2f}",
+                f"{r.max:.2f}",
+                len(r.times)
+            ])
+
+    return output.getvalue()
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Benchmark suite for zipgrep and other grep tools.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    %(prog)s --download           Download test corpora
+    %(prog)s --list               List available benchmarks
+    %(prog)s                      Run all benchmarks
+    %(prog)s linux                Run benchmarks matching 'linux'
+    %(prog)s --raw                Output CSV format
+        """
+    )
+
+    parser.add_argument(
+        '--download',
+        action='store_true',
+        help='Download test corpora'
+    )
+
+    parser.add_argument(
+        '--dir',
+        default=DEFAULT_CACHE_DIR,
+        help=f'Cache directory for corpora (default: {DEFAULT_CACHE_DIR})'
+    )
+
+    parser.add_argument(
+        '--list',
+        action='store_true',
+        help='List available benchmarks'
+    )
+
+    parser.add_argument(
+        '--raw',
+        action='store_true',
+        help='Output raw CSV data'
+    )
+
+    parser.add_argument(
+        '--runs',
+        type=int,
+        default=DEFAULT_RUNS,
+        help=f'Number of benchmark runs (default: {DEFAULT_RUNS})'
+    )
+
+    parser.add_argument(
+        '--warmup',
+        type=int,
+        default=DEFAULT_WARMUP,
+        help=f'Number of warmup runs (default: {DEFAULT_WARMUP})'
+    )
+
+    parser.add_argument(
+        '--allow-missing',
+        action='store_true',
+        help='Skip benchmarks for missing tools instead of failing'
+    )
+
+    parser.add_argument(
+        'filters',
+        nargs='*',
+        help='Benchmark name filters (substring match)'
+    )
+
+    args = parser.parse_args()
+
+    # Handle --download
+    if args.download:
+        download_all(args.dir)
+        return 0
+
+    # Get all benchmarks
+    all_benchmarks = get_benchmarks()
+
+    # Handle --list
+    if args.list:
+        print("Available benchmarks:")
+        for b in all_benchmarks:
+            print(f"  {b.name}")
+            print(f"    pattern: {b.pattern}")
+            print(f"    corpus: {b.corpus}")
+            tools = ', '.join(c.name for c in b.commands)
+            print(f"    tools: {tools}")
+            print()
+        return 0
+
+    # Filter benchmarks
+    if args.filters:
+        benchmarks = [
+            b for b in all_benchmarks
+            if any(f in b.name for f in args.filters)
+        ]
+        if not benchmarks:
+            print(f"No benchmarks match filters: {args.filters}")
+            return 1
+    else:
+        benchmarks = all_benchmarks
+
+    # Run benchmarks
+    all_results: Dict[str, List[Result]] = {}
+
+    print(f"Running {len(benchmarks)} benchmark(s)...")
+    print(f"  Runs: {args.runs}, Warmup: {args.warmup}")
+    print()
+
+    for benchmark in benchmarks:
+        print(f"[{benchmark.name}]")
+        print(f"  Pattern: {benchmark.pattern}")
+        print(f"  Corpus: {benchmark.corpus}")
+
+        try:
+            results = run_benchmark(
+                benchmark,
+                args.dir,
+                args.runs,
+                args.warmup,
+                args.allow_missing
+            )
+            all_results[benchmark.name] = results
+        except MissingCorpus as e:
+            print(f"  ERROR: {e}")
+            return 1
+        except MissingCommand as e:
+            print(f"  ERROR: {e}")
+            return 1
+
+        print()
+
+    # Output results
+    if args.raw:
+        print(format_csv(all_results))
+    else:
+        print(format_markdown(all_results))
+
+        # Save to runs/{date}/ directory
+        now = datetime.now()
+        date_str = now.strftime('%Y-%m-%d')
+        timestamp_str = now.strftime('%Y-%m-%d_%H-%M-%S')
+        runs_dir = path.join(path.dirname(__file__), 'runs', date_str)
+        os.makedirs(runs_dir, exist_ok=True)
+
+        md_path = path.join(runs_dir, f'{timestamp_str}_results.md')
+        csv_path = path.join(runs_dir, f'{timestamp_str}_results.csv')
+
+        with open(md_path, 'w') as f:
+            f.write(format_markdown(all_results))
+        with open(csv_path, 'w') as f:
+            f.write(format_csv(all_results))
+
+        print(f"Results saved to {runs_dir}/")
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
