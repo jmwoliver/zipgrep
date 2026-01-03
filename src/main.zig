@@ -31,6 +31,8 @@ pub const Config = struct {
     glob_patterns: []const GlobPattern = &.{},
     /// True if searching a single file or stdin (computed once to avoid repeated stat calls)
     is_single_source: bool = false,
+    /// True if searching only stdin (paths == ["-"])
+    is_stdin_only: bool = false,
 
     pub fn getNumThreads(self: Config) usize {
         if (self.num_threads) |n| return n;
@@ -40,14 +42,13 @@ pub const Config = struct {
         return @min(cpus, 8);
     }
 
-    /// Get effective line_number setting (auto = TTY and multi-source dependent)
-    /// Only show line numbers in auto mode when stdout is TTY AND
-    /// searching multiple files (directory or multiple paths)
-    pub fn showLineNumbers(self: Config, stdout_is_tty: bool, is_multi_source: bool) bool {
+    /// Get effective line_number setting (auto = TTY dependent, matches ripgrep)
+    /// Show line numbers in auto mode when stdout is TTY, unless searching stdin only
+    pub fn showLineNumbers(self: Config, stdout_is_tty: bool) bool {
         if (self.line_number) |explicit| return explicit;
-        // Auto mode: show line numbers only for TTY AND multi-source searches
-        // Single file/stdin: no line numbers
-        return stdout_is_tty and is_multi_source;
+        // Auto mode: show line numbers for TTY output unless stdin-only search
+        // This matches ripgrep behavior: is_terminal_stdout && !paths.is_only_stdin()
+        return stdout_is_tty and !self.is_stdin_only;
     }
 };
 
@@ -206,6 +207,9 @@ pub fn parseArgsFromSlice(allocator: std.mem.Allocator, args: []const []const u8
 
     config.paths = try paths.toOwnedSlice(allocator);
     config.glob_patterns = try glob_patterns.toOwnedSlice(allocator);
+
+    // Compute is_stdin_only (for line number auto-detection, matches ripgrep)
+    config.is_stdin_only = config.paths.len == 1 and std.mem.eql(u8, config.paths[0], "-");
 
     // Compute is_single_source once (avoid repeated stat calls in output formatting)
     config.is_single_source = config.paths.len == 1 and blk: {

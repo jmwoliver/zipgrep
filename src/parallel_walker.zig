@@ -585,7 +585,58 @@ pub const ParallelWalker = struct {
         var stream = reader.StreamingLineReader.init(alloc, path) catch return;
         defer stream.deinit();
 
-        // Use per-file buffer to batch output - reduces mutex contention
+        // For single-source searches, stream output directly for fast first-result time
+        // For multi-file searches, buffer to prevent interleaved output
+        if (self.config.is_single_source and !self.config.count_only and !self.config.files_with_matches) {
+            // Streaming path - write matches directly to stdout
+            if (self.pattern_matcher.is_literal and !self.pattern_matcher.word_boundary) {
+                // Literal pattern streaming search
+                const StreamCallback = struct {
+                    out: *output.Output,
+                    path: []const u8,
+                    done: bool,
+
+                    pub fn call(ctx: *@This(), line: reader.StreamingLineReader.Line, match_start: usize, match_end: usize) void {
+                        if (ctx.done) return;
+                        ctx.out.writeMatchDirect(.{
+                            .file_path = ctx.path,
+                            .line_number = line.number,
+                            .line_content = line.content,
+                            .match_start = match_start,
+                            .match_end = match_end,
+                        });
+                    }
+                };
+
+                var callback = StreamCallback{
+                    .out = self.out,
+                    .path = path,
+                    .done = false,
+                };
+
+                if (self.pattern_matcher.ignore_case) {
+                    _ = stream.searchLiteralIgnoreCase(self.pattern_matcher.pattern, &callback);
+                } else {
+                    _ = stream.searchLiteral(self.pattern_matcher.pattern, &callback);
+                }
+            } else {
+                // Regex pattern streaming search
+                while (stream.next()) |line| {
+                    if (self.pattern_matcher.findFirst(line.content)) |match_result| {
+                        self.out.writeMatchDirect(.{
+                            .file_path = path,
+                            .line_number = line.number,
+                            .line_content = line.content,
+                            .match_start = match_result.start,
+                            .match_end = match_result.end,
+                        });
+                    }
+                }
+            }
+            return;
+        }
+
+        // Buffered path - for multi-file searches or count/files-with-matches modes
         var file_buf = output.FileBuffer.init(alloc, self.config, self.out.colorEnabled(), self.out.headingEnabled());
         defer file_buf.deinit();
 

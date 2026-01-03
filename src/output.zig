@@ -42,9 +42,9 @@ pub const FileBuffer = struct {
     show_line_numbers: bool,
 
     pub fn init(allocator: std.mem.Allocator, config: main.Config, use_color: bool, use_heading: bool) FileBuffer {
-        // Resolve line_number setting
-        // Only show line numbers in auto mode for multi-source TTY output
-        const show_line_numbers = config.showLineNumbers(use_color, !config.is_single_source);
+        // Resolve line_number setting (use_color indicates TTY output)
+        // Matches ripgrep: show line numbers for TTY unless stdin-only
+        const show_line_numbers = config.showLineNumbers(use_color);
 
         return .{
             .buffer = .{},
@@ -248,6 +248,67 @@ pub const Output = struct {
     /// Check if heading mode is enabled (for creating FileBuffers)
     pub fn headingEnabled(self: *const Output) bool {
         return self.use_heading;
+    }
+
+    /// Write a match directly to output (for single-file streaming)
+    /// No buffering - writes immediately to stdout for fast first-result time
+    /// Only use for single-source searches where no mutex is needed
+    pub fn writeMatchDirect(self: *Output, match_data: Match) void {
+        const show_line_numbers = self.config.showLineNumbers(self.use_color);
+        var buf: [8192]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        const writer = fbs.writer();
+
+        if (self.use_heading) {
+            // Heading format: just line_number:content (no filename for single source)
+            if (show_line_numbers) {
+                if (self.use_color) {
+                    writer.print("{s}{d}{s}{s}:{s}", .{
+                        Color.line_num,
+                        match_data.line_number,
+                        Color.reset,
+                        Color.separator,
+                        Color.reset,
+                    }) catch return;
+                } else {
+                    writer.print("{d}:", .{match_data.line_number}) catch return;
+                }
+            }
+        } else {
+            // Flat format: line_number:content (no filename for single source)
+            if (show_line_numbers) {
+                if (self.use_color) {
+                    writer.print("{s}{d}{s}{s}:{s}", .{
+                        Color.line_num,
+                        match_data.line_number,
+                        Color.reset,
+                        Color.separator,
+                        Color.reset,
+                    }) catch return;
+                } else {
+                    writer.print("{d}:", .{match_data.line_number}) catch return;
+                }
+            }
+        }
+
+        // Print line content with highlighted match
+        if (self.use_color and match_data.match_end > match_data.match_start and match_data.match_end <= match_data.line_content.len) {
+            // Before match
+            writer.print("{s}", .{match_data.line_content[0..match_data.match_start]}) catch return;
+            // The match (highlighted)
+            writer.print("{s}{s}{s}", .{
+                Color.match,
+                match_data.line_content[match_data.match_start..match_data.match_end],
+                Color.reset,
+            }) catch return;
+            // After match
+            writer.print("{s}\n", .{match_data.line_content[match_data.match_end..]}) catch return;
+        } else {
+            writer.print("{s}\n", .{match_data.line_content}) catch return;
+        }
+
+        // Write directly to stdout
+        _ = self.file.write(fbs.getWritten()) catch {};
     }
 
     /// Flush a file buffer's contents to output - single lock for entire file
