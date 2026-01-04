@@ -7,15 +7,19 @@
 //! - States are nodes in a trie built from all patterns
 //! - Failure links allow backtracking without re-scanning input
 //! - Output links collect all matching patterns at each state
+//! - Uses dense transition tables for O(1) byte lookup
 //!
 //! Complexity:
-//! - Construction: O(sum of pattern lengths)
+//! - Construction: O(sum of pattern lengths × alphabet_size)
 //! - Search: O(input_length + number_of_matches)
 
 const std = @import("std");
 
 /// Maximum alphabet size (full byte range)
 const ALPHABET_SIZE: usize = 256;
+
+/// Sentinel value indicating no transition (state 0 is root, so we use max u32)
+const NO_TRANSITION: u32 = std.math.maxInt(u32);
 
 /// A match found by the automaton
 pub const Match = struct {
@@ -28,11 +32,11 @@ pub const Match = struct {
 };
 
 /// A single state in the Aho-Corasick automaton
+/// Uses dense transition tables for O(1) lookup per byte
 const State = struct {
-    /// Goto transitions for each byte value
-    /// Uses a sparse representation: stores (byte, state) pairs
-    /// For states with few transitions, this is more memory efficient than [256]?u32
-    transitions: std.ArrayListUnmanaged(Transition),
+    /// Dense transition table - goto[byte] = next_state or NO_TRANSITION
+    /// This uses more memory but provides O(1) transition lookup
+    goto: [ALPHABET_SIZE]u32,
 
     /// Failure link - where to go when no direct transition
     failure: u32,
@@ -43,14 +47,9 @@ const State = struct {
     /// Depth of this state (pattern prefix length)
     depth: u16,
 
-    const Transition = struct {
-        byte: u8,
-        state: u32,
-    };
-
     fn init() State {
         return .{
-            .transitions = .{},
+            .goto = [_]u32{NO_TRANSITION} ** ALPHABET_SIZE,
             .failure = 0,
             .outputs = .{},
             .depth = 0,
@@ -58,21 +57,18 @@ const State = struct {
     }
 
     fn deinit(self: *State, allocator: std.mem.Allocator) void {
-        self.transitions.deinit(allocator);
         self.outputs.deinit(allocator);
     }
 
     /// Get the transition for a given byte, or null if none
-    fn getTransition(self: *const State, byte: u8) ?u32 {
-        for (self.transitions.items) |t| {
-            if (t.byte == byte) return t.state;
-        }
-        return null;
+    inline fn getTransition(self: *const State, byte: u8) ?u32 {
+        const next = self.goto[byte];
+        return if (next == NO_TRANSITION) null else next;
     }
 
-    /// Add a transition for a given byte
-    fn addTransition(self: *State, allocator: std.mem.Allocator, byte: u8, state: u32) !void {
-        try self.transitions.append(allocator, .{ .byte = byte, .state = state });
+    /// Set transition for a given byte
+    inline fn setTransition(self: *State, byte: u8, state: u32) void {
+        self.goto[byte] = state;
     }
 
     /// Add an output pattern index
@@ -132,7 +128,7 @@ pub const AhoCorasick = struct {
                 var new = State.init();
                 new.depth = self.states.items[state].depth + 1;
                 try self.states.append(self.allocator, new);
-                try self.states.items[state].addTransition(self.allocator, c, new_state);
+                self.states.items[state].setTransition(c, new_state);
                 state = new_state;
             }
         }
@@ -146,9 +142,13 @@ pub const AhoCorasick = struct {
         defer queue.deinit(self.allocator);
 
         // Initialize: all depth-1 states have failure link to root
-        for (self.states.items[0].transitions.items) |t| {
-            self.states.items[t.state].failure = 0;
-            try queue.append(self.allocator, t.state);
+        // Iterate over all possible bytes to find transitions from root
+        for (0..ALPHABET_SIZE) |byte_idx| {
+            const byte: u8 = @intCast(byte_idx);
+            if (self.states.items[0].getTransition(byte)) |next_state| {
+                self.states.items[next_state].failure = 0;
+                try queue.append(self.allocator, next_state);
+            }
         }
 
         // BFS to compute failure links for remaining states
@@ -156,9 +156,10 @@ pub const AhoCorasick = struct {
         while (head < queue.items.len) : (head += 1) {
             const state = queue.items[head];
 
-            for (self.states.items[state].transitions.items) |t| {
-                const next_state = t.state;
-                const c = t.byte;
+            // Iterate over all possible bytes to find transitions from this state
+            for (0..ALPHABET_SIZE) |byte_idx| {
+                const c: u8 = @intCast(byte_idx);
+                const next_state = self.states.items[state].getTransition(c) orelse continue;
 
                 try queue.append(self.allocator, next_state);
 

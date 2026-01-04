@@ -1,5 +1,6 @@
 const std = @import("std");
 const simd = @import("simd.zig");
+const aho_corasick = @import("aho_corasick.zig");
 
 /// Line iterator for processing file content line by line
 pub const LineIterator = struct {
@@ -482,6 +483,110 @@ pub const StreamingLineReader = struct {
 
             // Count remaining newlines from last_counted_pos to end of consumed portion
             // Use SIMD for faster counting
+            current_line += simd.countNewlines(buffer_data[last_counted_pos..consumed_len]);
+            self.line_number = current_line - 1;
+
+            // Move to keep only the lookback bytes
+            self.data_start = self.data_end - keep_bytes;
+
+            if (self.eof_reached) break;
+            if (!self.refillBuffer()) break;
+        }
+
+        return found_any;
+    }
+
+    /// Search for multiple literal patterns using Aho-Corasick automaton with a callback.
+    /// This is much faster than line-by-line searching for alternation patterns like "foo|bar|baz".
+    /// If ignore_case is true, performs case-insensitive matching by lowercasing the buffer.
+    ///
+    /// callback is called with each matching line (Line, match_start, match_end).
+    /// Returns true if any matches were found.
+    pub fn searchMultiLiteralWithCallback(
+        self: *StreamingLineReader,
+        ac: *const aho_corasick.AhoCorasick,
+        max_pattern_len: usize,
+        callback: anytype,
+        lower_buf: ?[]u8,
+        ignore_case: bool,
+    ) bool {
+        if (self.is_binary) return false;
+
+        var found_any = false;
+
+        // Process buffers until EOF
+        while (true) {
+            // Ensure we have data in buffer
+            if (self.data_end == self.data_start) {
+                if (self.eof_reached) break;
+                if (!self.refillBuffer()) break;
+                continue;
+            }
+
+            const buffer_data = self.buffer[self.data_start..self.data_end];
+
+            // For case-insensitive search, lowercase the buffer first
+            var search_data: []const u8 = buffer_data;
+            if (ignore_case) {
+                if (lower_buf) |lb| {
+                    const copy_len = @min(buffer_data.len, lb.len);
+                    for (buffer_data[0..copy_len], 0..) |c, i| {
+                        lb[i] = std.ascii.toLower(c);
+                    }
+                    search_data = lb[0..copy_len];
+                }
+            }
+
+            // Track position in buffer for incremental line counting
+            var last_counted_pos: usize = 0;
+            var current_line = self.line_number + 1; // 1-indexed
+
+            // Search entire buffer using Aho-Corasick
+            var search_pos: usize = 0;
+            while (search_pos < search_data.len) {
+                // Find pattern in remaining buffer using AC
+                const match_result = ac.findFirstFrom(search_data, search_pos) orelse break;
+                const match_pos = match_result.start;
+                const match_len = match_result.end - match_result.start;
+
+                found_any = true;
+
+                // Find line start (search backwards for newline) - use original buffer
+                var line_start: usize = match_pos;
+                while (line_start > 0 and buffer_data[line_start - 1] != '\n') {
+                    line_start -= 1;
+                }
+
+                // Find line end (search forwards for newline) - use original buffer
+                var line_end: usize = match_pos + match_len;
+                while (line_end < buffer_data.len and buffer_data[line_end] != '\n') {
+                    line_end += 1;
+                }
+
+                // Count newlines incrementally from last_counted_pos to line_start
+                current_line += simd.countNewlines(buffer_data[last_counted_pos..line_start]);
+                last_counted_pos = line_start;
+
+                // Use original buffer_data for the line content (preserves original case)
+                const line_content = buffer_data[line_start..line_end];
+                const match_in_line_start = match_pos - line_start;
+                const match_in_line_end = match_in_line_start + match_len;
+
+                // Call callback with match info
+                callback.call(Line{
+                    .content = line_content,
+                    .number = current_line,
+                }, match_in_line_start, match_in_line_end);
+
+                // Move past this line to avoid duplicate matches on same line
+                search_pos = line_end + 1;
+            }
+
+            // Keep max_pattern_len - 1 bytes at end in case pattern spans buffer boundary
+            const keep_bytes = @min(if (max_pattern_len > 0) max_pattern_len - 1 else 0, buffer_data.len);
+            const consumed_len = buffer_data.len - keep_bytes;
+
+            // Count remaining newlines from last_counted_pos to end of consumed portion
             current_line += simd.countNewlines(buffer_data[last_counted_pos..consumed_len]);
             self.line_number = current_line - 1;
 
