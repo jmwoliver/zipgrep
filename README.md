@@ -135,97 +135,105 @@ zg -j 8 "pattern" .    # Use 8 threads
 
 ## How It Works
 
-### SIMD-Accelerated Search
+### Two-Byte SIMD Fingerprinting
 
-zipgrep uses Zig's `@Vector` types for SIMD-accelerated byte searching:
+The key optimization that makes zipgrep fast is **two-byte fingerprinting**: searching for the first AND last byte of a pattern simultaneously. This reduces false positives by ~256x compared to single-byte search (based on ripgrep's "packed pair" algorithm from the memchr crate).
 
 ```zig
-const Vec = @Vector(16, u8);  // 128-bit vectors on ARM64
+// Instead of searching for just 'h' in "hello", search for 'h' AND 'o' at the correct offset
+const first_vec: Vec = @splat(first_byte);   // 'h'
+const last_vec: Vec = @splat(last_byte);     // 'o'
 
-pub fn findByte(haystack: []const u8, needle: u8) ?usize {
-    const needle_vec: Vec = @splat(needle);
-    // Process 16 bytes at a time
-    while (i + 16 <= haystack.len) : (i += 16) {
-        const chunk: Vec = haystack[i..][0..16].*;
-        const matches = chunk == needle_vec;
-        if (@reduce(.Or, matches)) {
-            return i + @ctz(@as(u16, @bitCast(matches)));
-        }
-    }
-    // ... scalar fallback
-}
+// Load both positions in one pass
+const first_chunk: Vec = haystack[pos..][0..VECTOR_WIDTH].*;
+const last_chunk: Vec = haystack[pos + offset..][0..VECTOR_WIDTH].*;
+
+// Only positions where BOTH bytes match are candidates
+const mask = @as(MaskType, @bitCast(first_chunk == first_vec)) &
+             @as(MaskType, @bitCast(last_chunk == last_vec));
 ```
 
-### Literal String Optimization
+For case-insensitive search, this checks **4 byte combinations** per position (upper/lower × first/last).
 
-Before applying regex matching, zipgrep extracts literal substrings from patterns to enable fast pre-filtering:
+### Architecture-Aware Vectorization
+
+zipgrep automatically uses the widest SIMD available:
+- **AVX2** (32 bytes) on x86_64 with AVX2 support
+- **NEON** (16 bytes) on ARM64 (Apple Silicon, etc.)
+- **Fallback** (16 bytes) on other architectures
+
+### Aho-Corasick Multi-Pattern Search
+
+For alternation patterns like `ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT`, zipgrep uses the Aho-Corasick algorithm instead of regex:
+
+- **O(n) search**: Single pass through input regardless of number of patterns
+- **Dense transition tables**: O(1) byte lookup using 256-entry arrays per state
+- **Automatic detection**: Pure-literal alternation patterns are routed to AC automaton
+
+### Literal Extraction & Scoring
+
+Before applying regex matching, zipgrep extracts literal substrings for SIMD pre-filtering:
 
 ```zig
-// For pattern "hello.*world", extract "hello" as a prefix literal
-// Use SIMD to quickly find candidates, then apply full regex only on matches
-const info = literal.extractLiteral(pattern);
-
 switch (info.position) {
-    .prefix => {
-        // Most efficient: literal must appear at line start
-        // Example: "hello.*" -> scan for "hello" at position 0
-    },
-    .suffix => {
-        // Second best: literal must appear at line end
-        // Example: ".*_PLATFORM" -> scan for "_PLATFORM" at end
-    },
-    .inner => {
-        // Fallback: literal appears somewhere in the match
-        // Example: "[a-z]+_FOO_[a-z]+" -> scan for "_FOO_"
-    },
+    .prefix => // "hello.*" -> scan for "hello" first
+    .suffix => // ".*_PLATFORM" -> scan for "_PLATFORM" first
+    .inner =>  // "[a-z]+_FOO_[a-z]+" -> scan for "_FOO_" first
 }
 ```
 
-The literal extraction uses a scoring system to select the most selective literal:
+The scoring system selects the most selective literal:
 - Longer literals score higher (better filtering)
-- Rare characters (`_`, `Q`, `X`, `Z`, digits) score higher than common letters
-- This enables fast rejection of non-matching lines before expensive regex evaluation
+- Rare characters (`_`, `Q`, `X`, `Z`, digits) score higher than common letters (`e`, `t`, `a`, ` `)
+
+### Buffer-First Search
+
+Instead of processing files line-by-line, zipgrep searches the entire buffer for the pattern first, then only processes lines that contain matches:
+
+- **1MB buffer**: Large buffer reduces syscall overhead
+- **SIMD newline counting**: Uses vectorized `@popCount` for fast line number calculation
+- **Pattern overlap handling**: Keeps `pattern_len - 1` bytes at buffer boundaries
 
 ### Regex Engine
 
-zipgrep implements a Thompson NFA-based regex engine supporting:
-- `.` - any character (except newline)
-- `*` - zero or more
-- `+` - one or more
-- `?` - zero or one
-- `|` - alternation
-- `[abc]` - character classes
-- `[^abc]` - negated character classes
-- `[a-z]` - character ranges
-- `\n`, `\t`, `\r` - escape sequences
+zipgrep implements a Thompson NFA-based regex engine with:
+- **Bitset state tracking**: No allocations during matching (256-state bitset)
+- **Literal pre-filtering**: SIMD finds candidates before NFA evaluation
+- **Greedy pattern optimization**: For `.*SUFFIX` patterns, reduces O(n²) to O(n)
+
+Supported syntax: `.`, `*`, `+`, `?`, `|`, `[abc]`, `[^abc]`, `[a-z]`, `\n`, `\t`, `\r`
+
+### Parallelism
+
+zipgrep uses parallel directory traversal with work stealing:
+- **Parallel traversal**: Directory walking and file searching happen concurrently
+- **Work stealing**: Threads use a deque to balance work dynamically
+- **Configurable**: Use `-j N` to control thread count (defaults to CPU core count)
+- **Sorted output**: Results are collected and sorted for consistent ordering
 
 ### File I/O Strategy
 
 | Scenario | Strategy |
 |----------|----------|
-| Files < 128MB | Memory-mapped I/O (zero-copy) |
-| Larger files | Buffered reading (64KB chunks) |
-| stdin | Buffered reading |
+| All files | Streaming with 1MB buffer |
+| stdin | Streaming with 1MB buffer |
 
-### Parallelism
+## Benchmarks
 
-zipgrep uses parallel directory traversal for concurrent file searching:
+Benchmarks comparing zipgrep (`zg`) vs ripgrep (`rg`) on the Linux kernel source (~74K files, 1.1GB) and English subtitles corpus (~130MB). Each benchmark runs 5 times with 3 warmup runs.
 
-```zig
-// Parallel walker spawns worker threads for directory traversal
-const parallel_walker = try ParallelWalker.init(allocator, num_threads, options);
-defer parallel_walker.deinit();
+| Benchmark | Pattern | zg (median) | rg (median) | Speedup |
+|-----------|---------|-------------|-------------|---------|
+| linux_literal | `PM_RESUME` | 1241ms | 2069ms | **1.67x** |
+| linux_literal_casei | `PM_RESUME` (case-insensitive) | 1260ms | 1876ms | **1.49x** |
+| linux_word | `PM_RESUME` (word boundary) | 1299ms | 2099ms | **1.62x** |
+| linux_re_suffix | `[A-Z]+_RESUME` | 1203ms | 1882ms | **1.56x** |
+| linux_alternates | `ERR_SYS\|PME_TURN_OFF\|...` | 1572ms | 2029ms | **1.29x** |
+| linux_alternates_casei | (case-insensitive) | 1507ms | 1867ms | **1.24x** |
+| subtitles_literal | `Sherlock Holmes` | 1415ms | 1509ms | **1.07x** |
+| subtitles_literal_casei | (case-insensitive) | 1826ms | 2885ms | **1.58x** |
 
-// Workers use a shared deque for work stealing
-// Each thread processes directories and searches files concurrently
-parallel_walker.walk(root_path, matcher, output);
-```
-
-Key characteristics:
-- **Parallel traversal** - Directory walking and file searching happen concurrently
-- **Work stealing** - Threads use a deque to balance work dynamically
-- **Configurable** - Use `-j N` to control thread count (defaults to CPU core count)
-- **Sorted output** - Results are collected and sorted for consistent ordering
+**Summary**: zipgrep is 1.07x-1.67x faster than ripgrep across all tested scenarios.
 
 ## Project Structure
 
@@ -235,19 +243,19 @@ zipgrep/
 ├── build.zig.zon         # Package manifest
 ├── src/
 │   ├── main.zig          # CLI entry point and argument parsing
-│   ├── simd.zig          # SIMD byte/substring search
+│   ├── simd.zig          # SIMD byte/substring search (two-byte fingerprinting)
 │   ├── regex.zig         # Thompson NFA regex engine
-│   ├── literal.zig       # Literal string extraction for optimization
+│   ├── literal.zig       # Literal extraction and alternation detection
+│   ├── aho_corasick.zig  # Aho-Corasick multi-pattern search
 │   ├── matcher.zig       # Pattern matching coordinator
 │   ├── walker.zig        # Directory traversal and binary detection
-│   ├── parallel_walker.zig # Parallel directory traversal
-│   ├── reader.zig        # File I/O (mmap + buffered)
+│   ├── parallel_walker.zig # Parallel directory traversal with work stealing
+│   ├── reader.zig        # Streaming file I/O with buffer-first search
 │   ├── gitignore.zig     # Gitignore and glob pattern parsing
 │   ├── output.zig        # Colorized output formatting
 │   └── deque.zig         # Double-ended queue for work distribution
 ├── tests/                # Integration tests
-└── bench/
-    └── run_benchmarks.sh # Benchmark script
+└── benchsuite/           # Benchmark suite
 ```
 
 ## Comparison with ripgrep
@@ -256,7 +264,7 @@ zipgrep/
 
 | Feature | zipgrep | ripgrep |
 |---------|--------|---------|
-| Literal search speed | ✓ Faster (small dirs) | ✓ Faster (large dirs) |
+| Literal search speed | ✓ 1.07x-1.67x faster | ✓ |
 | Full PCRE2 regex | ✗ Basic only | ✓ Full support |
 | Unicode support | ✗ ASCII only | ✓ Full Unicode |
 | Binary file detection | ✓ NUL-byte based | ✓ More sophisticated |

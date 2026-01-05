@@ -32,7 +32,7 @@ from typing import Dict, List
 # =============================================================================
 
 DEFAULT_CACHE_DIR = path.expanduser("~/.cache/zipgrep-bench")
-DEFAULT_RUNS = 10
+DEFAULT_RUNS = 5
 DEFAULT_WARMUP = 3
 
 # Corpus URLs
@@ -133,15 +133,6 @@ SCRIPT_DIR = path.dirname(path.abspath(__file__))
 PROJECT_ROOT = path.dirname(SCRIPT_DIR)
 LOCAL_ZG = path.join(PROJECT_ROOT, 'zig-out', 'bin', 'zg')
 
-
-def cmd_rg(extra_args: List[str] = None) -> Command:
-    """ripgrep command."""
-    args = ['--no-config', '--color', 'never']
-    if extra_args:
-        args.extend(extra_args)
-    return Command('rg', 'rg', args)
-
-
 def cmd_zg(extra_args: List[str] = None) -> Command:
     """zipgrep command - uses local build if available."""
     # Prefer local build over system-installed zg
@@ -151,38 +142,12 @@ def cmd_zg(extra_args: List[str] = None) -> Command:
         args.extend(extra_args)
     return Command('zg', binary, args)
 
-
-def cmd_grep(extra_args: List[str] = None) -> Command:
-    """GNU grep command."""
-    args = ['-r', '-n', '--color=never']
+def cmd_rg(extra_args: List[str] = None) -> Command:
+    """ripgrep command."""
+    args = ['--no-config', '--color', 'never']
     if extra_args:
         args.extend(extra_args)
-    return Command('grep', 'grep', args)
-
-
-def cmd_grep_single(extra_args: List[str] = None) -> Command:
-    """GNU grep for single file (no -r)."""
-    args = ['-n', '--color=never']
-    if extra_args:
-        args.extend(extra_args)
-    return Command('grep', 'grep', args)
-
-
-def cmd_ag(extra_args: List[str] = None) -> Command:
-    """The Silver Searcher command."""
-    args = ['--nocolor']
-    if extra_args:
-        args.extend(extra_args)
-    return Command('ag', 'ag', args)
-
-
-def cmd_ugrep(extra_args: List[str] = None) -> Command:
-    """ugrep command."""
-    args = ['--color=never']
-    if extra_args:
-        args.extend(extra_args)
-    return Command('ugrep', 'ugrep', args)
-
+    return Command('rg', 'rg', args)
 
 # =============================================================================
 # Benchmark Definitions
@@ -202,11 +167,8 @@ def get_benchmarks() -> List[Benchmark]:
         pattern='PM_RESUME',
         corpus='linux',
         commands=[
-            cmd_rg(),
             cmd_zg(),
-            # cmd_grep(),
-            # cmd_ag(),
-            # cmd_ugrep(),
+            cmd_rg(),
         ]
     ))
 
@@ -217,11 +179,8 @@ def get_benchmarks() -> List[Benchmark]:
         corpus='linux',
         case_insensitive=True,
         commands=[
-            cmd_rg(['-i']),
             cmd_zg(['-i']),
-            # cmd_grep(['-i']),
-            # cmd_ag(['-i']),
-            # cmd_ugrep(['-i']),
+            cmd_rg(['-i']),
         ]
     ))
 
@@ -232,11 +191,8 @@ def get_benchmarks() -> List[Benchmark]:
         corpus='linux',
         word_boundary=True,
         commands=[
-            cmd_rg(['-w']),
             cmd_zg(['-w']),
-            # cmd_grep(['-w']),
-            # cmd_ag(['-w']),
-            # cmd_ugrep(['-w']),
+            cmd_rg(['-w']),
         ]
     ))
 
@@ -246,11 +202,8 @@ def get_benchmarks() -> List[Benchmark]:
         pattern='[A-Z]+_RESUME',
         corpus='linux',
         commands=[
-            cmd_rg(),
             cmd_zg(),
-            # cmd_grep(['-E']),
-            # cmd_ag(),
-            # cmd_ugrep(['-E']),
+            cmd_rg(),
         ]
     ))
 
@@ -260,11 +213,8 @@ def get_benchmarks() -> List[Benchmark]:
         pattern='ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT',
         corpus='linux',
         commands=[
-            cmd_rg(),
             cmd_zg(),
-            # cmd_grep(['-E']),
-            # cmd_ag(),
-            # cmd_ugrep(['-E']),
+            cmd_rg(),
         ]
     ))
 
@@ -275,27 +225,8 @@ def get_benchmarks() -> List[Benchmark]:
         corpus='linux',
         case_insensitive=True,
         commands=[
-            cmd_rg(['-i']),
             cmd_zg(['-i']),
-            # cmd_grep(['-E', '-i']),
-            # cmd_ag(['-i']),
-            # cmd_ugrep(['-E', '-i']),
-        ]
-    ))
-
-    # Complex regex (no literal optimization possible)
-    # NOTE: Uses \w and \s which are Unicode-aware in rg but ASCII-only in zg
-    # This tests pure regex performance without literal optimizations
-    benchmarks.append(Benchmark(
-        name='linux_no_literal',
-        pattern=r'\w{5}\s+\w{5}\s+\w{5}\s+\w{5}\s+\w{5}',
-        corpus='linux',
-        commands=[
-            cmd_rg(),
-            cmd_zg(),
-            # cmd_grep(['-E']),
-            # cmd_ag(),
-            # cmd_ugrep(['-E']),
+            cmd_rg(['-i']),
         ]
     ))
 
@@ -309,11 +240,8 @@ def get_benchmarks() -> List[Benchmark]:
         pattern='Sherlock Holmes',
         corpus='subtitles-en',
         commands=[
-            cmd_rg(),
             cmd_zg(),
-            # cmd_grep_single(),
-            # cmd_ag(['--search-files']),
-            # cmd_ugrep(),
+            cmd_rg(),
         ]
     ))
 
@@ -324,11 +252,8 @@ def get_benchmarks() -> List[Benchmark]:
         corpus='subtitles-en',
         case_insensitive=True,
         commands=[
-            cmd_rg(['-i']),
             cmd_zg(['-i']),
-            # cmd_grep_single(['-i']),
-            # cmd_ag(['--search-files', '-i']),
-            # cmd_ugrep(['-i']),
+            cmd_rg(['-i']),
         ]
     ))
 
@@ -339,11 +264,8 @@ def get_benchmarks() -> List[Benchmark]:
         corpus='subtitles-en',
         word_boundary=True,
         commands=[
-            cmd_rg(['-w']),
             cmd_zg(['-w']),
-            # cmd_grep_single(['-w']),
-            # cmd_ag(['--search-files', '-w']),
-            # cmd_ugrep(['-w']),
+            cmd_rg(['-w']),
         ]
     ))
 
@@ -353,26 +275,8 @@ def get_benchmarks() -> List[Benchmark]:
         pattern='Sherlock Holmes|John Watson|Professor Moriarty|Mrs. Hudson',
         corpus='subtitles-en',
         commands=[
-            cmd_rg(),
             cmd_zg(),
-            # cmd_grep_single(['-E']),
-            # cmd_ag(['--search-files']),
-            # cmd_ugrep(['-E']),
-        ]
-    ))
-
-    # Complex regex
-    # NOTE: Uses \w and \s which are Unicode-aware in rg but ASCII-only in zg
-    benchmarks.append(Benchmark(
-        name='subtitles_no_literal',
-        pattern=r'\w{5}\s+\w{5}\s+\w{5}',
-        corpus='subtitles-en',
-        commands=[
             cmd_rg(),
-            cmd_zg(),
-            # cmd_grep_single(['-E']),
-            # cmd_ag(['--search-files']),
-            # cmd_ugrep(['-E']),
         ]
     ))
 
