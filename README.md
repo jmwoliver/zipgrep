@@ -14,7 +14,7 @@ zipgrep recursively searches directories for a regex pattern while respecting `.
 - **Parallel file searching** using a thread pool across multiple CPU cores
 - **Inherited gitignore support** - applies repository and nested `.gitignore` rules
 - **Glob file filtering** with `-g` flag for include/exclude patterns
-- **ripgrep-compatible binary handling** for recursive, explicit-file, and streamed input
+- **NUL-based binary handling** with ripgrep-like recursive and explicit-file behavior
 - **Colorized output** - file paths, line numbers, and matches are highlighted
 - **Smart output formatting** - auto-detects TTY vs pipe for heading/color defaults
 - **Bounded I/O memory** using rolling stream buffers or reclaimable 8 MiB mmap windows
@@ -78,7 +78,7 @@ zg [OPTIONS] PATTERN [PATH ...]
 | `-g, --glob GLOB` | Include/exclude files or directories (supports `!` for negation) |
 | `--no-ignore` | Don't respect `.gitignore` files |
 | `--hidden` | Search hidden files and directories |
-| `-j, --threads NUM` | Number of threads to use (default: CPU count) |
+| `-j, --threads NUM` | Number of threads to use (default: CPU count, capped at 8) |
 | `-d, --max-depth NUM` | Maximum directory depth to search |
 | `--color MODE` | Color mode: `auto`, `always`, `never` (default: `auto`) |
 | `--heading` | Group matches by file with headers (default for TTY) |
@@ -208,14 +208,14 @@ zipgrep implements a Thompson NFA-based regex engine with:
 - **Literal pre-filtering**: SIMD finds candidates before NFA evaluation
 - **Greedy pattern optimization**: For `.*SUFFIX` patterns, reduces O(n²) to O(n)
 
-Supported syntax includes `.`, `*`, `+`, `?`, `{m}`, `{m,}`, `{m,n}`, grouping, alternation, `^`, `$`, Unicode literals and class ranges, negated classes, `\d`/`\D`, `\s`/`\S`, `\w`/`\W`, and escaped control characters.
+Supported syntax includes `.`, `*`, `+`, `?`, `{m}`, `{m,}`, `{m,n}`, grouping, alternation, `^`, `$`, Unicode literals and class ranges, negated classes, `\d`/`\D`, `\s`/`\S`, `\w`/`\W`, escaped metacharacters, and `\t`/`\r`. Search remains line-oriented, so patterns containing a literal newline or `\n` are rejected.
 
 ### Parallelism
 
 zipgrep uses parallel directory traversal with work stealing:
 - **Parallel traversal**: Directory walking and file searching happen concurrently
 - **Safe work stealing**: Owner-LIFO/stealer-FIFO deques use synchronized claims so an owning work item can never be processed twice
-- **Configurable**: Use `-j N` to control thread count (defaults to CPU core count)
+- **Configurable**: Use `-j N` to control thread count (automatic mode uses up to 8 CPU cores)
 - **Batched output**: Each file is emitted under one output lock; explicit `-j 1` inputs retain command-line order
 
 ### File I/O Strategy
@@ -231,6 +231,8 @@ zipgrep uses parallel directory traversal with work stealing:
 
 Warm-cache medians below compare a `ReleaseFast` build with ripgrep 15.2.0 invoked using `--no-config`. They were measured on an 8-vCPU Intel Xeon Linux orb in August 2026. Results are workload- and hardware-dependent; they are evidence for these corpora, not a claim that any implementation wins universally.
 
+These tables record the focused measurements used during the optimization work. Raw samples and the exact harness are not committed, and the checked-in `benchsuite` does not currently reproduce the count, quiet, list, stdin, color, or RSS scenarios below. Treat the figures as reported results rather than independently reproducible benchmark artifacts.
+
 ### 512 MiB English subtitle file
 
 | Mode and pattern | zg | rg | zg / rg |
@@ -240,7 +242,7 @@ Warm-cache medians below compare a `ReleaseFast` build with ripgrep 15.2.0 invok
 | count `.` | 607.1 ms | 1294.2 ms | **0.47** |
 | count `-w .` | 646.0 ms | 1541.9 ms | **0.42** |
 | count `[^abc]+` | 640.9 ms | 1956.7 ms | **0.33** |
-| count `-i 'Sherlock\|John'` | 117.0 ms | 205.5 ms | **0.57** |
+| count <code>-i 'Sherlock&#124;John'</code> | 117.0 ms | 205.5 ms | **0.57** |
 | sparse matching output | 116.5 ms | 125.1 ms | **0.93** |
 | dense matching output | 1096.7 ms | 1983.4 ms | **0.55** |
 | quiet, early match | 0.5 ms | 1.8 ms | **0.26** |
@@ -299,24 +301,32 @@ zipgrep/
 
 ### Feature Matrix
 
-| Feature | zipgrep | ripgrep |
-|---------|--------|---------|
-| Literal search speed | ✓ 1.07x-1.67x faster | ✓ |
-| Full PCRE2 regex | ✗ Basic only | ✓ Full support |
-| Unicode support | ✗ ASCII only | ✓ Full Unicode |
-| Binary file detection | ✓ NUL-byte based | ✓ More sophisticated |
-| Word boundary matching | ✓ `-w` flag | ✓ `-w` flag or `\b` |
-| File glob filtering | ✓ `-g` flag | ✓ `-g` flag |
-| Compressed file search | ✗ No | ✓ Yes |
-| JSON output | ✗ No | ✓ Yes |
-| Replace mode | ✗ No | ✓ Yes |
-| Context lines (-A/-B/-C) | ✗ No | ✓ Yes |
-| Multiline matching | ✗ No | ✓ Yes |
-| Binary size | ~500 KB | ~6.5 MB |
+This comparison targets ripgrep 15.2.0. Ripgrep uses its Rust finite-automata regex engine by default; look-around, backreferences, and other PCRE2-only constructs require a build with PCRE2 and the `-P`/`--pcre2` flag.
+
+| Feature | zipgrep | ripgrep 15.2.0 |
+|---------|---------|----------------|
+| Performance | Faster in the reported warm-cache workloads above | Workload dependent |
+| Regex engine | Custom bounded Thompson/Pike NFA with bounded DFA acceleration | Rust regex automata by default; optional PCRE2 via `-P` |
+| Counted repetition | ✓ `{m}`, `{m,}`, `{m,n}`; subject to a 256-state NFA limit | ✓ |
+| Lazy quantifiers and captures | ✗ | ✓ in the default engine |
+| Look-around and pattern backreferences | ✗ | ✓ with `-P`; not supported by the default engine |
+| Unicode scalars | ✓ literals, `.`, bracket literals/ranges, and simple case folding | ✓ |
+| Unicode classes | Unicode 16.0 `\w`; ASCII `\d` and `\s`; no `\p{...}` | Broad Unicode classes, properties, scripts, and case folding |
+| Word matching | ✓ Unicode-aware `-w`; no `\b` syntax | ✓ `-w` and Unicode `\b` |
+| File glob filtering | ✓ basic `-g` include/exclude patterns | ✓ `-g`, file types, and richer traversal controls |
+| Ignore sources | Repository and nested `.gitignore` | `.gitignore`, `.ignore`, `.rgignore`, Git excludes, global excludes, and explicit ignore files |
+| Binary handling | NUL-based; recursive and explicit-file modes; no binary controls and stdin differs | NUL-based with explicit/implicit policies, `--binary`, and `-a/--text` |
+| Context lines (`-A`/`-B`/`-C`) | ✗ | ✓ |
+| Multiline matching | ✗ | ✓ with `-U`; dot-all is configured separately |
+| Compressed streams | ✗ | ✓ gzip, bzip2, xz, LZ4, LZMA, Brotli, and Zstd via external helpers |
+| JSON output | ✗ | ✓ |
+| Output replacement | ✗ | ✓; changes output, not files |
+| Encoding/transcoding | ✗ raw bytes plus UTF-8-aware regex paths | ✓ BOM detection and `--encoding` |
+| Binary size | About 2.2 MiB | About 5.2 MiB for the Linux musl binary used in the benchmarks |
 
 ### What zipgrep Supports
 
-Can use zipgrep when:
+zipgrep is a good fit for fast line-oriented searching when its smaller CLI and regex surface are sufficient:
 
 ```bash
 # Simple literal searches in your project
@@ -337,6 +347,15 @@ zg "[0-9]+" data.txt       # Numbers
 zg "foo|bar" .             # Alternation
 zg "test_.*.zig" src/      # Wildcards
 
+# Shorthand classes and counted repetition
+zg '\d{3}-\d{4}' data.txt   # ASCII digits
+zg '\w{2,8}' names.txt      # Unicode Perl word characters
+
+# Unicode literals, ranges, case folding, and word matching
+zg '[α-ω]+' text.txt
+zg -i 'école' text.txt
+zg -w 'cache' text.txt
+
 # File filtering
 zg "TODO" -g '*.py'        # Only Python files
 zg "import" -g '!vendor/'  # Exclude vendor directory
@@ -350,92 +369,76 @@ zg -l "FIXME" .
 
 ### When to Use ripgrep Instead
 
-Use ripgrep for these **unsupported patterns**:
+Use ripgrep when a search needs features outside zipgrep's intentionally smaller surface:
 
 ```bash
-# Character class shortcuts - NOT SUPPORTED
-rg '\d{3}-\d{4}' .           # Phone numbers (digits)
-rg '\w+@\w+\.\w+' .          # Email-like patterns
-rg '\s+' .                   # Whitespace
-# zipgrep alternative: use explicit classes
-zg '[0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]' .
-zg '[a-zA-Z0-9]+@[a-zA-Z0-9]+' .
+# Unicode properties and Unicode semantics for \d and \s
+rg '\p{Greek}+' .
+rg '\d+' .                   # Includes non-ASCII decimal digits
 
-# Quantifier ranges {n,m} - NOT SUPPORTED
-rg 'a{2,4}' .                # 2 to 4 'a's
-rg '.{10,}' .                # 10+ characters
-# zipgrep has no equivalent
+# Word-boundary assertions, lazy quantifiers, captures, and inline flags
+rg '\bword\b' .
+rg '".*?"' .
+rg '(?P<name>\w+)' .
+rg '(?i:error)' .
 
-# Lookahead/lookbehind - NOT SUPPORTED
-rg '(?<=\$)\d+' .            # Numbers after $
-rg 'foo(?=bar)' .            # foo followed by bar
-# zipgrep has no equivalent
+# Look-around and pattern backreferences require PCRE2
+rg -P '(?<=\$)\d+' .
+rg -P '(\w+)\s+\1' .
 
-# Non-greedy quantifiers - NOT SUPPORTED
-rg '".*?"' .                 # Shortest quoted string
-# zipgrep's .* is always greedy
+# Cross-line matching; -U permits newlines and (?s:...) makes dot match them
+rg -U '(?s:start.*?end)' .
 
-# Backreferences - NOT SUPPORTED
-rg '(\w+)\s+\1' .            # Repeated words
-# zipgrep has no equivalent
-
-# Unicode patterns - NOT SUPPORTED
-rg '[\p{Greek}]+' .          # Greek letters
-rg '\p{Emoji}' .             # Emoji characters
-# zipgrep is ASCII-only
-
-# Multiline patterns - NOT SUPPORTED
-rg -U 'start.*?end' .        # Match across lines
-# zipgrep matches line-by-line only
-
-# Context lines - NOT SUPPORTED
-rg -A 3 -B 2 'error' .       # Show surrounding lines
-# zipgrep has no equivalent
-
-# Search in compressed files - NOT SUPPORTED
-rg -z 'pattern' file.gz
-# zipgrep cannot read compressed files
-
-# Replace mode - NOT SUPPORTED
-rg 'old' --replace 'new' .
-# zipgrep is search-only
-
-# JSON output for tooling - NOT SUPPORTED
+# Context, structured output, and output replacement
+rg -A 3 -B 2 'error' .
 rg --json 'pattern' .
-# zipgrep outputs text only
+rg 'old' --replace 'new' .
 
-# Binary file handling - NOT SUPPORTED
+# Search supported compressed streams
+rg -z 'pattern' file.gz
+
+# Control binary policy or emit binary bytes as text
 rg --binary 'pattern' binary.exe
-# zipgrep may produce garbled output on binary files
+rg -a 'pattern' binary.exe
 
-# Very large codebases (90k+ files)
-rg 'pattern' ~/linux         # ripgrep is ~1.5x faster here
+# Multiple patterns, pattern files, fixed strings, types, and encodings
+rg -e 'TODO' -e 'FIXME' .
+rg -f patterns.txt .
+rg -F 'literal.*text' .
+rg -tpy 'import' .
+rg --encoding utf-16le 'name' data.txt
 ```
+
+Despite the historical name of ripgrep's `-z/--search-zip` flag, it searches supported compressed streams; it does not traverse members of ZIP or tar archives.
 
 ### Quick Reference: Regex Support
 
 | Pattern | zipgrep | ripgrep | Example |
 |---------|--------|---------|---------|
 | Literal text | ✓ | ✓ | `hello` |
-| Any character | ✓ `.` | ✓ | `h.llo` → hello, hallo |
+| Any Unicode scalar except newline | ✓ `.` | ✓ | `h.llo` → hello, hallo |
 | Zero or more | ✓ `*` | ✓ | `ab*c` → ac, abc, abbc |
 | One or more | ✓ `+` | ✓ | `ab+c` → abc, abbc |
 | Optional | ✓ `?` | ✓ | `colou?r` → color, colour |
-| Alternation | ✓ `\|` | ✓ | `cat\|dog` |
+| Counted repetition | ✓, bounded by NFA size | ✓ | `a{2,4}` |
+| Alternation | ✓ <code>&#124;</code> | ✓ | <code>cat&#124;dog</code> |
+| Plain grouping | ✓, no captures exposed | ✓, capturing | <code>(cat&#124;dog)+</code> |
 | Character class | ✓ `[abc]` | ✓ | `[aeiou]` |
 | Negated class | ✓ `[^abc]` | ✓ | `[^0-9]` |
-| Range | ✓ `[a-z]` | ✓ | `[A-Za-z]` |
-| Escape sequences | ✓ `\n\t\r` | ✓ | `line1\nline2` |
-| Word boundary | ✓ `-w` flag | ✓ `-w` or `\b` | `zg -w "word"` |
-| Digit | ✗ | ✓ `\d` | `\d+` |
-| Word char | ✗ | ✓ `\w` | `\w+` |
-| Whitespace | ✗ | ✓ `\s` | `\s+` |
-| Quantifier range | ✗ | ✓ `{n,m}` | `a{2,4}` |
+| Unicode literal/range | ✓ | ✓ | `[α-ω]+` |
+| Tab/carriage-return escapes | ✓ `\t`/`\r` | ✓ | `key\tvalue` |
+| Newline escape/cross-line match | ✗ | ✓ with `-U` | `line1\nline2` |
+| Whole-word mode | ✓ Unicode-aware `-w` | ✓ `-w` | `zg -w "word"` |
+| Word-boundary assertion | ✗ | ✓ `\b` | `\bword\b` |
+| Digit | ✓ ASCII `\d` | ✓ Unicode `\d` | `\d+` |
+| Word char | ✓ Unicode 16.0 `\w` | ✓ Unicode `\w` | `\w+` |
+| Whitespace | ✓ ASCII `\s` | ✓ Unicode `\s` | `\s+` |
 | Non-greedy | ✗ | ✓ `*?` `+?` | `".*?"` |
-| Lookahead | ✗ | ✓ `(?=)` | `foo(?=bar)` |
-| Lookbehind | ✗ | ✓ `(?<=)` | `(?<=\$)\d+` |
-| Backreference | ✗ | ✓ `\1` | `(\w+)\s+\1` |
-| Named groups | ✗ | ✓ `(?P<name>)` | `(?P<word>\w+)` |
+| Captures/named groups | ✗ | ✓ | `(?P<word>\w+)` |
+| Inline flags | ✗ | ✓ | `(?i:error)` |
+| Lookahead | ✗ | ✓ with `-P` | `foo(?=bar)` |
+| Lookbehind | ✗ | ✓ with `-P` | `(?<=\$)\d+` |
+| Pattern backreference | ✗ | ✓ with `-P` | `(\w+)\s+\1` |
 | Unicode classes | ✗ | ✓ `\p{L}` | `\p{Greek}` |
 
 ## Why Zig?
@@ -450,13 +453,17 @@ zipgrep demonstrates several Zig advantages for systems programming:
 
 ## Areas of Improvement
 
-- [ ] Full Unicode support
-- [ ] More regex features (`\d`, `\w`, `\s`, `{n,m}`, lookahead, etc.)
+- [ ] Unicode properties/scripts, Unicode `\d`/`\s`, `\b`, and Unicode/byte mode controls
+- [ ] Lazy quantifiers, captures, named/non-capturing groups, inline flags, look-around, and backreferences
+- [ ] Multiline matching
 - [ ] Context lines (`-A`, `-B`, `-C` flags)
 - [ ] JSON output format
 - [ ] Replace mode (`--replace`)
-- [ ] Compressed file search (`.gz`, `.zip`)
-- [ ] More sophisticated binary file detection
+- [ ] Compressed stream search (`.gz`, `.bz2`, `.xz`, `.zst`, etc.)
+- [ ] Binary stdin parity and `--binary`/`-a` controls
+- [ ] `.ignore`, `.rgignore`, Git exclude files, richer gitignore semantics, file types, and symlink controls
+- [ ] Multiple/pattern-file/fixed-string input, encoding support, stable sorting, and machine-oriented output controls
+- [ ] A reproducible benchmark harness covering the published timing and RSS scenarios
 
 ## License
 
