@@ -1,4 +1,6 @@
-# zipgrep Codebase Deep Dive: A Newcomer's Guide
+# Historical zipgrep Codebase Deep Dive: A Newcomer's Guide
+
+> **Status:** This guide describes an earlier implementation. In particular, its line references and lock-free deque description are obsolete; the current deque deliberately synchronizes ownership claims for safety. See the root README and current source for the maintained architecture summary.
 
 This report provides a comprehensive analysis of the zipgrep codebase - a high-performance grep implementation written in Zig. It covers key Zig language concepts, algorithms, data structures, and optimizations that make zipgrep work efficiently.
 

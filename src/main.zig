@@ -21,6 +21,7 @@ pub const Config = struct {
     line_number: ?bool = null, // null = auto (true for TTY, false for pipe)
     count_only: bool = false,
     files_with_matches: bool = false,
+    quiet: bool = false,
     no_ignore: bool = false,
     hidden: bool = false,
     word_boundary: bool = false,
@@ -35,7 +36,7 @@ pub const Config = struct {
     is_stdin_only: bool = false,
 
     pub fn getNumThreads(self: Config) usize {
-        if (self.num_threads) |n| return n;
+        if (self.num_threads) |n| if (n != 0) return n;
         // Default to number of CPUs, but cap at 8 to avoid syscall overhead
         // from excessive thread wake/sleep cycles on high core count systems
         const cpus = std.Thread.getCpuCount() catch 4;
@@ -52,7 +53,12 @@ pub const Config = struct {
     }
 };
 
-pub fn main() !void {
+pub fn main() void {
+    const exit_code = mainResult();
+    if (exit_code != 0) std.process.exit(exit_code);
+}
+
+fn mainResult() u8 {
     // Use page allocator backing an arena for fast bulk allocations
     // Arena is much faster than GeneralPurposeAllocator for our use case
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -61,12 +67,18 @@ pub fn main() !void {
 
     const config = parseArgs(allocator) catch |err| {
         if (err == error.HelpRequested) {
-            return;
+            return 0;
         }
-        return err;
+        std.debug.print("zg: {s}\n", .{@errorName(err)});
+        return 2;
     };
 
-    try run(allocator, config);
+    const matched = run(allocator, config) catch |err| {
+        if (err == error.BrokenPipe) return 0;
+        std.debug.print("zg: {s}\n", .{@errorName(err)});
+        return 2;
+    };
+    return if (matched) 0 else 1;
 }
 
 fn parseArgs(allocator: std.mem.Allocator) !Config {
@@ -101,9 +113,12 @@ pub fn parseArgsFromSlice(allocator: std.mem.Allocator, args: []const []const u8
     };
 
     var i: usize = 0;
+    var options_done = false;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.startsWith(u8, arg, "-") and !std.mem.eql(u8, arg, "-")) {
+        if (!options_done and std.mem.eql(u8, arg, "--")) {
+            options_done = true;
+        } else if (!options_done and std.mem.startsWith(u8, arg, "-") and !std.mem.eql(u8, arg, "-")) {
             // Flag argument (but "-" alone means stdin, not a flag)
             if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
                 printHelp();
@@ -116,6 +131,8 @@ pub fn parseArgsFromSlice(allocator: std.mem.Allocator, args: []const []const u8
                 config.count_only = true;
             } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--files-with-matches")) {
                 config.files_with_matches = true;
+            } else if (std.mem.eql(u8, arg, "-q") or std.mem.eql(u8, arg, "--quiet")) {
+                config.quiet = true;
             } else if (std.mem.eql(u8, arg, "--no-ignore")) {
                 config.no_ignore = true;
             } else if (std.mem.eql(u8, arg, "--hidden")) {
@@ -239,6 +256,7 @@ fn printHelp() void {
         \\    -n, --line-number       Show line numbers (default: on for TTY, off for pipes)
         \\    -c, --count             Only show count of matching lines
         \\    -l, --files-with-matches Only show filenames with matches
+        \\    -q, --quiet             Do not print matches; stop after the first match
         \\    -w, --word-regexp       Only match whole words
         \\    -g, --glob GLOB         Include/exclude files or directories (! prefix to exclude)
         \\    --no-ignore             Don't respect .gitignore files
@@ -268,7 +286,7 @@ fn printHelp() void {
     std.debug.print("{s}", .{help});
 }
 
-fn run(allocator: std.mem.Allocator, config: Config) !void {
+fn run(allocator: std.mem.Allocator, config: Config) !bool {
     // With arena allocator, no need to free individual allocations
     // The arena handles bulk deallocation at the end
 
@@ -299,11 +317,7 @@ fn run(allocator: std.mem.Allocator, config: Config) !void {
     defer w.deinit();
 
     try w.walk();
-
-    // Print final stats if counting (skip for single file/stdin - already printed)
-    if (config.count_only and !config.is_single_source) {
-        try out.printTotalCount();
-    }
+    return out.hasMatches();
 }
 
 test "parseArgs pattern only" {
@@ -383,6 +397,16 @@ test "parseArgs -l flag" {
     defer allocator.free(config.paths);
 
     try std.testing.expect(config.files_with_matches);
+}
+
+test "parseArgs quiet flag" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "--quiet", "pattern" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expect(config.quiet);
 }
 
 test "parseArgs --no-ignore flag" {
@@ -549,6 +573,16 @@ test "Config getNumThreads default" {
     try std.testing.expect(threads >= 1);
 }
 
+test "Config zero threads selects automatic count" {
+    const config = Config{
+        .pattern = "test",
+        .paths = &[_][]const u8{"."},
+        .num_threads = 0,
+    };
+
+    try std.testing.expect(config.getNumThreads() >= 1);
+}
+
 test "parseArgs combined flags" {
     const allocator = std.testing.allocator;
     const args = [_][]const u8{ "-i", "-c", "--hidden", "pattern", "src/" };
@@ -573,6 +607,17 @@ test "parseArgs flags after pattern" {
 
     try std.testing.expect(config.ignore_case);
     try std.testing.expectEqualStrings("pattern", config.pattern);
+}
+
+test "parseArgs double dash permits a hyphenated pattern" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "--", "-Version", "src/" };
+
+    const config = try parseArgsFromSlice(allocator, &args);
+    defer allocator.free(config.paths);
+
+    try std.testing.expectEqualStrings("-Version", config.pattern);
+    try std.testing.expectEqualStrings("src/", config.paths[0]);
 }
 
 test "parseArgs -g glob inclusion" {

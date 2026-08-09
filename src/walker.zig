@@ -57,23 +57,21 @@ pub const Walker = struct {
             }
         }
 
-        // Use parallel walker for multi-threaded operation
-        if (num_threads > 1) {
-            var pw = try parallel_walker.ParallelWalker.init(
-                self.allocator,
-                self.config,
-                self.pattern_matcher,
-                self.ignore_matcher,
-                self.out,
-            );
-            defer pw.deinit();
+        _ = num_threads;
 
-            try pw.walk();
-            return;
-        }
+        // One implementation owns traversal and searching at every thread
+        // count. ParallelWalker avoids spawning a thread for its one-worker
+        // path, preserving zipgrep's tiny explicit-file startup latency.
+        var pw = try parallel_walker.ParallelWalker.init(
+            self.allocator,
+            self.config,
+            self.pattern_matcher,
+            self.ignore_matcher,
+            self.out,
+        );
+        defer pw.deinit();
 
-        // Fall back to sequential walker for single-threaded operation
-        try self.walkSequential();
+        try pw.walk();
     }
 
     /// Sequential implementation (original behavior)
@@ -248,7 +246,13 @@ pub const Walker = struct {
         }
 
         // Use FileBuffer with "<stdin>" as path
-        var file_buf = output.FileBuffer.init(self.allocator, self.config, self.out.colorEnabled(), self.out.headingEnabled());
+        var file_buf = output.FileBuffer.initResolved(
+            self.allocator,
+            self.config,
+            self.out.colorEnabled(),
+            self.out.headingEnabled(),
+            self.out.lineNumbersEnabled(),
+        );
         defer file_buf.deinit();
 
         var line_iter = reader.LineIterator.init(data);
@@ -258,13 +262,13 @@ pub const Walker = struct {
                 if (self.config.count_only) {
                     file_buf.match_count += 1;
                 } else {
-                    try file_buf.addMatch(.{
+                    try file_buf.addMatchWithMatcher(.{
                         .file_path = "<stdin>",
                         .line_number = line.number,
                         .line_content = line.content,
                         .match_start = match_result.start,
                         .match_end = match_result.end,
-                    });
+                    }, self.pattern_matcher);
 
                     if (self.config.files_with_matches) break;
                 }
@@ -297,20 +301,28 @@ pub const Walker = struct {
             // Streaming path - write matches directly to stdout
             while (stream.next()) |line| {
                 if (self.pattern_matcher.findFirst(line.content)) |match_result| {
-                    self.out.writeMatchDirect(.{
+                    try self.out.writeMatchDirect(.{
                         .file_path = path,
                         .line_number = line.number,
                         .line_content = line.content,
                         .match_start = match_result.start,
                         .match_end = match_result.end,
-                    });
+                    }, self.pattern_matcher);
+                    self.out.finishDirectMatch();
                 }
             }
+            try self.out.flushDirect();
             return;
         }
 
         // Buffered path - for multi-file searches or count/files-with-matches modes
-        var file_buf = output.FileBuffer.init(alloc, self.config, self.out.colorEnabled(), self.out.headingEnabled());
+        var file_buf = output.FileBuffer.initResolved(
+            alloc,
+            self.config,
+            self.out.colorEnabled(),
+            self.out.headingEnabled(),
+            self.out.lineNumbersEnabled(),
+        );
         defer file_buf.deinit();
 
         while (stream.next()) |line| {
@@ -318,13 +330,13 @@ pub const Walker = struct {
                 if (self.config.count_only) {
                     file_buf.match_count += 1;
                 } else {
-                    try file_buf.addMatch(.{
+                    try file_buf.addMatchWithMatcher(.{
                         .file_path = path,
                         .line_number = line.number,
                         .line_content = line.content,
                         .match_start = match_result.start,
                         .match_end = match_result.end,
-                    });
+                    }, self.pattern_matcher);
 
                     if (self.config.files_with_matches) break;
                 }

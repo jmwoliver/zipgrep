@@ -6,32 +6,98 @@ const output = @import("output.zig");
 const gitignore = @import("gitignore.zig");
 const deque = @import("deque.zig");
 const aho_corasick = @import("aho_corasick.zig");
+const simd = @import("simd.zig");
 
-/// A unit of work for the parallel walker
-/// Uses page_allocator which is thread-safe for concurrent allocation/deallocation
+/// One immutable level in a directory's inherited ignore context. Nodes are
+/// shared by child jobs and may cross worker threads through work stealing.
+const IgnoreNode = struct {
+    const allocator = std.heap.smp_allocator;
+
+    ref_count: std.atomic.Value(usize),
+    state: gitignore.GitignoreState,
+    parent: ?*IgnoreNode,
+
+    fn create(state: gitignore.GitignoreState, parent: ?*IgnoreNode) !*IgnoreNode {
+        const node = try allocator.create(IgnoreNode);
+        if (parent) |p| p.retain();
+        node.* = .{
+            .ref_count = std.atomic.Value(usize).init(1),
+            .state = state,
+            .parent = parent,
+        };
+        return node;
+    }
+
+    fn retain(self: *IgnoreNode) void {
+        _ = self.ref_count.fetchAdd(1, .monotonic);
+    }
+
+    fn release(self: *IgnoreNode) void {
+        if (self.ref_count.fetchSub(1, .acq_rel) != 1) return;
+
+        const parent = self.parent;
+        self.state.deinit();
+        allocator.destroy(self);
+        if (parent) |p| p.release();
+    }
+};
+
+/// A unit of work for the parallel walker. Files are first-class jobs so a
+/// single wide directory can use every search worker.
 pub const WorkItem = struct {
-    /// Path to the directory to process
+    const Kind = enum { directory, file };
+
     path: []const u8,
-
-    /// Depth in the directory tree
     depth: usize,
+    kind: Kind,
+    binary_scan_all: bool,
+    ignore_node: ?*IgnoreNode,
 
-    /// Thread-safe allocator for WorkItems - page_allocator is safe for concurrent use
-    const allocator = std.heap.page_allocator;
+    // The SMP allocator avoids one mmap/munmap pair per discovered file while
+    // remaining safe for producer/consumer allocation on different threads.
+    const allocator = std.heap.smp_allocator;
 
     pub fn init(dir_path: []const u8, depth: usize) !*WorkItem {
-        const owned_path = try allocator.dupe(u8, dir_path);
-        errdefer allocator.free(owned_path);
+        return initDirectory(dir_path, depth, null);
+    }
 
+    fn initDirectory(dir_path: []const u8, depth: usize, ignore_node: ?*IgnoreNode) !*WorkItem {
+        return initKind(dir_path, depth, .directory, true, ignore_node);
+    }
+
+    pub fn initFile(file_path: []const u8, binary_scan_all: bool) !*WorkItem {
+        return initKind(file_path, 0, .file, binary_scan_all, null);
+    }
+
+    fn initOwnedFile(file_path: []u8, binary_scan_all: bool) !*WorkItem {
+        return initOwnedKind(file_path, 0, .file, binary_scan_all, null);
+    }
+
+    fn initOwnedDirectory(dir_path: []u8, depth: usize, ignore_node: ?*IgnoreNode) !*WorkItem {
+        return initOwnedKind(dir_path, depth, .directory, true, ignore_node);
+    }
+
+    fn initKind(path: []const u8, depth: usize, kind: Kind, binary_scan_all: bool, ignore_node: ?*IgnoreNode) !*WorkItem {
+        const owned_path = try allocator.dupe(u8, path);
+        return initOwnedKind(owned_path, depth, kind, binary_scan_all, ignore_node);
+    }
+
+    fn initOwnedKind(owned_path: []u8, depth: usize, kind: Kind, binary_scan_all: bool, ignore_node: ?*IgnoreNode) !*WorkItem {
+        errdefer allocator.free(owned_path);
         const item = try allocator.create(WorkItem);
         item.* = .{
             .path = owned_path,
             .depth = depth,
+            .kind = kind,
+            .binary_scan_all = binary_scan_all,
+            .ignore_node = ignore_node,
         };
+        if (ignore_node) |node| node.retain();
         return item;
     }
 
     pub fn deinit(self: *WorkItem) void {
+        if (self.ignore_node) |node| node.release();
         allocator.free(self.path);
         allocator.destroy(self);
     }
@@ -62,12 +128,18 @@ pub const ParallelWalker = struct {
 
     /// Termination signal
     done: std.atomic.Value(bool),
+    cancelled: std.atomic.Value(bool),
 
     /// Count of active workers (for termination detection)
     active_workers: std.atomic.Value(usize),
 
     /// Count of workers that have finished initialization
     initialized_workers: std.atomic.Value(usize),
+
+    /// Worker-side I/O/allocation errors are recorded and reported after join.
+    had_error: std.atomic.Value(bool),
+    broken_pipe: std.atomic.Value(bool),
+    error_mutex: std.Thread.Mutex,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -85,18 +157,21 @@ pub const ParallelWalker = struct {
         const deques = try allocator.alloc(?*deque.Deque(*WorkItem), num_threads);
         errdefer allocator.free(deques);
         @memset(deques, null);
+        errdefer {
+            for (deques) |d| {
+                if (d) |dq| dq.deinit();
+            }
+        }
 
         const threads = try allocator.alloc(std.Thread, num_threads);
         errdefer allocator.free(threads);
 
         // Initialize deques
         for (0..num_threads) |i| {
-            deques[i] = try deque.Deque(*WorkItem).init(allocator);
-        }
-        errdefer {
-            for (deques) |d| {
-                if (d) |dq| dq.deinit();
-            }
+            // Queue backing arrays grow independently on worker threads. The
+            // caller allocator is normally a non-thread-safe arena, so queue
+            // internals must use a shared concurrent allocator.
+            deques[i] = try deque.Deque(*WorkItem).init(std.heap.smp_allocator);
         }
 
         walker.* = .{
@@ -109,8 +184,12 @@ pub const ParallelWalker = struct {
             .deques = deques,
             .threads = threads,
             .done = std.atomic.Value(bool).init(false),
+            .cancelled = std.atomic.Value(bool).init(false),
             .active_workers = std.atomic.Value(usize).init(num_threads),
             .initialized_workers = std.atomic.Value(usize).init(0),
+            .had_error = std.atomic.Value(bool).init(false),
+            .broken_pipe = std.atomic.Value(bool).init(false),
+            .error_mutex = .{},
         };
 
         return walker;
@@ -139,53 +218,96 @@ pub const ParallelWalker = struct {
         var has_stdin = false;
 
         // Distribute initial paths to worker deques (round-robin)
-        var path_idx: usize = 0;
-        for (self.config.paths) |path| {
+        var work_count: usize = 0;
+        for (self.config.paths, 0..) |_, input_index| {
+            if (self.done.load(.acquire)) break;
+            // The owner end of the deque is LIFO. Reverse initial insertion
+            // for the one-worker path so explicit sources are searched in
+            // command-line order without changing the deque's semantics.
+            const path_index = if (self.num_threads == 1)
+                self.config.paths.len - input_index - 1
+            else
+                input_index;
+            const path = self.config.paths[path_index];
             // Skip stdin - process after files
             if (std.mem.eql(u8, path, "-")) {
                 has_stdin = true;
                 continue;
             }
 
-            const stat = std.fs.cwd().statFile(path) catch continue;
+            const stat = std.fs.cwd().statFile(path) catch |err| {
+                self.recordError(path, err);
+                continue;
+            };
             if (stat.kind == .directory) {
                 const work_item = try WorkItem.init(path, 0);
-                const target_deque = path_idx % self.num_threads;
+                const target_deque = work_count % self.num_threads;
 
                 var worker_handle = self.deques[target_deque].?.worker();
-                try worker_handle.push(work_item);
-                path_idx += 1;
+                worker_handle.push(work_item) catch |err| {
+                    work_item.deinit();
+                    return err;
+                };
+                work_count += 1;
             } else {
-                // Process individual files directly (check glob patterns first)
                 if (gitignore.matchesGlobPatterns(path, false, self.config.glob_patterns)) {
-                    self.searchFile(path, self.allocator) catch {};
+                    // Keep the common one-file path on the caller thread to
+                    // preserve sub-millisecond startup. Multiple explicit
+                    // files are stealable just like recursively found files.
+                    if (self.config.is_single_source) {
+                        try self.searchFile(path, std.heap.smp_allocator, false);
+                    } else {
+                        const work_item = try WorkItem.initFile(path, false);
+                        const target_deque = work_count % self.num_threads;
+                        var worker_handle = self.deques[target_deque].?.worker();
+                        worker_handle.push(work_item) catch |err| {
+                            work_item.deinit();
+                            return err;
+                        };
+                        work_count += 1;
+                    }
                 }
             }
         }
 
         // If no directories to process, skip to stdin
-        if (path_idx == 0) {
+        if (work_count == 0) {
             // Process stdin last (after files) so output appears before blocking
             if (has_stdin) {
-                self.searchStdin() catch {};
+                try self.searchStdin();
             }
+            if (self.had_error.load(.acquire)) return error.SearchFailed;
             return;
         }
 
-        // Spawn worker threads - pass walker and worker_id directly
-        for (0..self.num_threads) |i| {
-            self.threads[i] = try std.Thread.spawn(.{}, workerThreadFn, .{ self, i });
-        }
+        if (self.num_threads == 1) {
+            // Avoid thread creation on explicit -j1 and sequential traversal.
+            self.workerThreadFn(0);
+        } else {
+            // Spawn worker threads - pass walker and worker_id directly
+            var spawned: usize = 0;
+            for (0..self.num_threads) |i| {
+                self.threads[i] = std.Thread.spawn(.{}, workerThreadFn, .{ self, i }) catch |err| {
+                    self.done.store(true, .release);
+                    self.initialized_workers.store(self.num_threads, .release);
+                    for (self.threads[0..spawned]) |thread| thread.join();
+                    return err;
+                };
+                spawned += 1;
+            }
 
-        // Wait for all workers to complete
-        for (self.threads) |thread| {
-            thread.join();
+            // Wait for all workers to complete
+            for (self.threads) |thread| {
+                thread.join();
+            }
         }
 
         // Process stdin AFTER files (so file output appears before blocking on stdin)
-        if (has_stdin) {
-            self.searchStdin() catch {};
+        if (has_stdin and !self.cancelled.load(.acquire) and !self.broken_pipe.load(.acquire)) {
+            try self.searchStdin();
         }
+        if (self.broken_pipe.load(.acquire)) return error.BrokenPipe;
+        if (self.had_error.load(.acquire)) return error.SearchFailed;
     }
 
     /// Worker thread function - creates its own arena allocator on the stack
@@ -205,24 +327,35 @@ pub const ParallelWalker = struct {
         while (self.initialized_workers.load(.acquire) < self.num_threads) {
             std.atomic.spinLoopHint();
         }
+        if (self.done.load(.acquire)) return;
 
         var consecutive_empty: u32 = 0;
 
         while (true) {
+            if (self.done.load(.acquire)) break;
             // Try to get work - first from own deque, then steal
             const work_item = worker_handle.pop() orelse self.trySteal(worker_id);
 
             if (work_item) |item| {
                 // Got work - process it
                 consecutive_empty = 0;
-                self.processDirectory(item, &worker_handle, thread_arena.allocator());
+                switch (item.kind) {
+                    .directory => self.processDirectory(item, &worker_handle, thread_arena.allocator()),
+                    .file => {
+                        defer item.deinit();
+                        const buffer_allocator = if (item.binary_scan_all) thread_arena.allocator() else std.heap.smp_allocator;
+                        self.searchFile(item.path, buffer_allocator, item.binary_scan_all) catch |err| {
+                            self.recordError(item.path, err);
+                        };
+                    },
+                }
 
                 // Reset arena to reclaim memory after each directory
                 // This is safe because all allocations from processDirectory are
                 // temporary (paths, gitignore state) and not referenced after return.
                 // WorkItem uses page_allocator separately and is unaffected.
                 // Using .retain_capacity keeps backing pages to avoid syscall overhead.
-                _ = thread_arena.reset(.retain_capacity);
+                _ = thread_arena.reset(.{ .retain_with_limit = 256 * 1024 });
 
                 continue;
             }
@@ -344,76 +477,6 @@ pub const ParallelWalker = struct {
         return null;
     }
 
-    /// Load .gitignore files from all parent directories of the given path
-    /// This walks from the search root down to the current directory, loading
-    /// any .gitignore files found along the way. This ensures nested gitignore
-    /// patterns are properly inherited even when work items are processed out of order.
-    fn loadParentGitignores(self: *ParallelWalker, ignore_state: *gitignore.GitignoreState, dir_path: []const u8, alloc: std.mem.Allocator) void {
-        // Get the search root - we need to find which config path this directory is under
-        var search_root: []const u8 = ".";
-        for (self.config.paths) |path| {
-            if (std.mem.startsWith(u8, dir_path, path)) {
-                search_root = path;
-                break;
-            }
-        }
-
-        // Normalize search root
-        var normalized_root = search_root;
-        if (std.mem.eql(u8, normalized_root, ".") and dir_path.len >= 2 and dir_path[0] == '.' and dir_path[1] == '/') {
-            normalized_root = "./";
-        }
-
-        // Build list of directories from root to current (in order)
-        var dirs_to_check = std.ArrayListUnmanaged([]const u8){};
-        defer {
-            for (dirs_to_check.items) |d| {
-                alloc.free(d);
-            }
-            dirs_to_check.deinit(alloc);
-        }
-
-        // Start with the full path and walk up to find all parent directories
-        var current = dir_path;
-        while (current.len > 0) {
-            // Don't go above search root
-            if (current.len < search_root.len) break;
-            if (std.mem.eql(u8, search_root, ".") and !std.mem.startsWith(u8, current, "./") and current.len > 0) {
-                // For "." root, stop at the first component
-                const dup = alloc.dupe(u8, current) catch break;
-                dirs_to_check.append(alloc, dup) catch {
-                    alloc.free(dup);
-                    break;
-                };
-                break;
-            }
-
-            const dup = alloc.dupe(u8, current) catch break;
-            dirs_to_check.append(alloc, dup) catch {
-                alloc.free(dup);
-                break;
-            };
-
-            // Move to parent directory
-            if (std.mem.lastIndexOf(u8, current, "/")) |idx| {
-                if (idx == 0) break;
-                current = current[0..idx];
-            } else {
-                break;
-            }
-        }
-
-        // Reverse to process from root to current directory
-        std.mem.reverse([]const u8, dirs_to_check.items);
-
-        // Load .gitignore from each directory in order
-        for (dirs_to_check.items) |dir| {
-            const gitignore_path = std.fs.path.join(alloc, &.{ dir, ".gitignore" }) catch continue;
-            defer alloc.free(gitignore_path);
-            ignore_state.loadFile(gitignore_path, dir) catch {};
-        }
-    }
-
     /// Process a single directory
     fn processDirectory(self: *ParallelWalker, work: *WorkItem, worker_handle: *deque.Worker(*WorkItem), alloc: std.mem.Allocator) void {
         defer work.deinit();
@@ -424,27 +487,56 @@ pub const ParallelWalker = struct {
         }
 
         // Open directory
-        var dir = std.fs.cwd().openDir(work.path, .{ .iterate = true }) catch return;
+        var dir = std.fs.cwd().openDir(work.path, .{ .iterate = true }) catch |err| {
+            self.recordError(work.path, err);
+            return;
+        };
         defer dir.close();
 
-        // Create thread-local gitignore state (only if not --no-ignore)
-        var ignore_state = gitignore.GitignoreState.init(alloc, self.base_ignore_matcher);
-        defer ignore_state.deinit();
+        // The root's .gitignore and its ancestors are already in the immutable
+        // base matcher. Every child loads only its own local file and shares its
+        // parent's persistent state with any child jobs it creates.
+        var effective_ignore = work.ignore_node;
+        var local_node: ?*IgnoreNode = null;
+        defer if (local_node) |node| node.release();
 
-        // Load .gitignore files from all parent directories up to and including current
-        // This ensures nested .gitignore patterns are properly inherited
-        if (self.base_ignore_matcher != null) {
-            self.loadParentGitignores(&ignore_state, work.path, alloc);
+        if (self.base_ignore_matcher != null and work.depth > 0) {
+            var local_state = gitignore.GitignoreState.init(
+                std.heap.smp_allocator,
+                if (work.ignore_node == null) self.base_ignore_matcher else null,
+            );
+            local_state.parent = if (work.ignore_node) |node| &node.state else null;
+            var state_moved = false;
+            defer if (!state_moved) local_state.deinit();
+
+            const gitignore_path = std.fs.path.join(alloc, &.{ work.path, ".gitignore" }) catch null;
+            if (gitignore_path) |path| {
+                local_state.loadFile(path, work.path) catch |err| {
+                    self.recordError(path, err);
+                };
+            }
+
+            if (local_state.localPatternCount() > 0) {
+                local_node = IgnoreNode.create(local_state, work.ignore_node) catch |err| {
+                    self.recordError(work.path, err);
+                    return;
+                };
+                state_moved = true;
+                effective_ignore = local_node;
+            }
         }
 
         // Iterate directory entries
         var iter = dir.iterate();
-        while (iter.next() catch null) |entry| {
+        while (true) {
+            if (self.done.load(.acquire)) break;
+            const entry = (iter.next() catch |err| {
+                self.recordError(work.path, err);
+                break;
+            }) orelse break;
             // Skip hidden files/dirs unless --hidden is set
             if (!self.config.hidden and entry.name.len > 0 and entry.name[0] == '.') {
-                if (entry.kind != .file or !std.mem.eql(u8, entry.name, ".gitignore")) {
-                    continue;
-                }
+                continue;
             }
 
             // Skip common VCS directories
@@ -452,376 +544,231 @@ pub const ParallelWalker = struct {
                 continue;
             }
 
-            const full_path = std.fs.path.join(alloc, &.{ work.path, entry.name }) catch continue;
+            const full_path = std.fs.path.join(WorkItem.allocator, &.{ work.path, entry.name }) catch |err| {
+                self.recordError(work.path, err);
+                continue;
+            };
             const is_dir = entry.kind == .directory;
 
             // Check gitignore
-            if (self.base_ignore_matcher != null or ignore_state.localPatternCount() > 0) {
-                if (ignore_state.isIgnored(full_path, is_dir)) {
-                    alloc.free(full_path);
+            if (effective_ignore) |node| {
+                if (node.state.isIgnored(full_path, is_dir)) {
+                    WorkItem.allocator.free(full_path);
+                    continue;
+                }
+            } else if (self.base_ignore_matcher) |base| {
+                if (base.isIgnored(full_path, is_dir)) {
+                    WorkItem.allocator.free(full_path);
                     continue;
                 }
             }
 
             // Check glob patterns from -g/--glob flags
             if (!gitignore.matchesGlobPatterns(full_path, is_dir, self.config.glob_patterns)) {
-                alloc.free(full_path);
+                WorkItem.allocator.free(full_path);
                 continue;
             }
 
             switch (entry.kind) {
                 .file => {
-                    // Search file immediately
-                    self.searchFile(full_path, alloc) catch {};
-                    alloc.free(full_path);
+                    // Queue files individually so flat directories scale.
+                    const new_work = WorkItem.initOwnedFile(full_path, true) catch |err| {
+                        self.recordError(work.path, err);
+                        continue;
+                    };
+                    worker_handle.push(new_work) catch |err| {
+                        self.recordError(new_work.path, err);
+                        new_work.deinit();
+                    };
                 },
                 .directory => {
                     // Push subdirectory to local deque
-                    const new_work = WorkItem.init(full_path, work.depth + 1) catch {
-                        alloc.free(full_path);
+                    const new_work = WorkItem.initOwnedDirectory(full_path, work.depth + 1, effective_ignore) catch |err| {
+                        self.recordError(work.path, err);
                         continue;
                     };
-                    alloc.free(full_path);
 
-                    worker_handle.push(new_work) catch {
+                    worker_handle.push(new_work) catch |err| {
+                        self.recordError(new_work.path, err);
                         new_work.deinit();
                     };
                 },
                 else => {
-                    alloc.free(full_path);
+                    WorkItem.allocator.free(full_path);
                 },
             }
         }
     }
 
-    /// Query available bytes in stdin using FIONREAD ioctl for pre-allocation hint
-    fn getStdinSizeHint(file: std.fs.File) usize {
-        const builtin = @import("builtin");
-        const FIONREAD: u32 = switch (builtin.os.tag) {
-            .macos, .ios, .tvos, .watchos => 0x4004667f,
-            .linux => 0x541B,
-            .freebsd, .netbsd, .openbsd, .dragonfly => 0x4004667f,
-            else => return 0, // Unsupported platform
-        };
-
-        var bytes_available: c_int = 0;
-        const rc = std.posix.system.ioctl(file.handle, FIONREAD, @as(usize, @intFromPtr(&bytes_available)));
-        if (rc == 0 and bytes_available > 0) {
-            return @intCast(bytes_available);
+    fn recordError(self: *ParallelWalker, path: []const u8, err: anyerror) void {
+        if (err == error.BrokenPipe) {
+            self.broken_pipe.store(true, .release);
+            self.done.store(true, .release);
+            return;
         }
-        return 0;
+        self.had_error.store(true, .release);
+        self.error_mutex.lock();
+        defer self.error_mutex.unlock();
+        std.debug.print("zg: {s}: {s}\n", .{ path, @errorName(err) });
     }
 
     /// Search stdin for matches
     fn searchStdin(self: *ParallelWalker) !void {
-        const stdin = std.fs.File.stdin();
-
-        // Read all stdin into buffer
-        var content: std.ArrayList(u8) = .empty;
-        defer content.deinit(self.allocator);
-
-        // Pre-allocate based on FIONREAD hint to reduce reallocations
-        const hint = getStdinSizeHint(stdin);
-        if (hint > 0) {
-            content.ensureTotalCapacity(self.allocator, hint) catch {};
-        }
-
-        var read_buf: [64 * 1024]u8 = undefined;
-        while (true) {
-            const bytes_read = stdin.read(&read_buf) catch break;
-            if (bytes_read == 0) break;
-            content.appendSlice(self.allocator, read_buf[0..bytes_read]) catch break;
-        }
-
-        const data = content.items;
-        if (data.len == 0) return;
-
-        // Binary detection: check first 8KB for NUL bytes
-        const check_len = @min(data.len, 8192);
-        for (data[0..check_len]) |byte| {
-            if (byte == 0) return; // Skip binary input
-        }
-
-        // Use FileBuffer with "<stdin>" as path
-        var file_buf = output.FileBuffer.init(self.allocator, self.config, self.out.colorEnabled(), self.out.headingEnabled());
-        defer file_buf.deinit();
-
-        var line_iter = reader.LineIterator.init(data);
-
-        while (line_iter.next()) |line| {
-            if (self.pattern_matcher.findFirst(line.content)) |match_result| {
-                if (self.config.count_only) {
-                    file_buf.match_count += 1;
-                } else {
-                    try file_buf.addMatch(.{
-                        .file_path = "<stdin>",
-                        .line_number = line.number,
-                        .line_content = line.content,
-                        .match_start = match_result.start,
-                        .match_end = match_result.end,
-                    });
-
-                    if (self.config.files_with_matches) break;
-                }
-            }
-        }
-
-        // Flush all buffered output
-        if (self.config.count_only) {
-            if (file_buf.match_count > 0) {
-                try self.out.printFileCount("<stdin>", file_buf.match_count);
-            }
-        } else {
-            try self.out.flushFileBuffer(&file_buf);
-        }
+        const buffer_size: usize = if (self.config.files_with_matches) 64 * 1024 else 256 * 1024;
+        var stream = try reader.StreamingLineReader.initFileWithBuffer(std.heap.smp_allocator, std.fs.File.stdin(), false, buffer_size);
+        defer stream.deinit();
+        try self.searchStream(&stream, "<stdin>");
     }
 
     /// Search a single file for matches using streaming reader.
-    /// Uses constant ~64KB memory regardless of file size.
-    fn searchFile(self: *ParallelWalker, path: []const u8, alloc: std.mem.Allocator) !void {
-        // Skip .gitignore files
-        if (std.mem.endsWith(u8, path, ".gitignore")) return;
-
-        // Use streaming reader - constant memory regardless of file size
-        var stream = reader.StreamingLineReader.init(alloc, path) catch return;
+    /// Uses memory proportional to the longest line, not the file size.
+    fn searchFile(self: *ParallelWalker, path: []const u8, buffer_allocator: std.mem.Allocator, binary_scan_all: bool) !void {
+        const buffer_size: usize = if (self.config.files_with_matches) 64 * 1024 else 256 * 1024;
+        var stream = try reader.StreamingLineReader.initWithOptions(buffer_allocator, path, binary_scan_all, buffer_size);
         defer stream.deinit();
+
+        try self.searchStream(&stream, path);
+    }
+
+    /// Unified matching/output path for recursive files, explicit files and
+    /// stdin. Keeping one implementation prevents mode-specific correctness
+    /// and performance drift.
+    fn searchStream(self: *ParallelWalker, stream: *reader.StreamingLineReader, path: []const u8) !void {
+        simd.resetSubstringCaches();
+        if (self.config.quiet) {
+            const QuietCallback = struct {
+                walker: *ParallelWalker,
+
+                pub fn call(ctx: *@This(), _: reader.StreamingLineReader.Line, _: usize, _: usize) !bool {
+                    ctx.walker.out.markMatched();
+                    ctx.walker.cancelled.store(true, .release);
+                    ctx.walker.done.store(true, .release);
+                    return false;
+                }
+            };
+            var callback = QuietCallback{ .walker = self };
+            _ = try stream.searchMatcher(
+                self.pattern_matcher,
+                &callback,
+                false,
+                false,
+                false,
+            );
+            return;
+        }
+
+        if (self.config.count_only) {
+            if (try stream.searchCountMatcher(self.pattern_matcher)) |count| {
+                if (count > 0 and !(stream.isBinary() and stream.quitsOnBinary())) {
+                    try self.out.printFileCount(path, count);
+                }
+                return;
+            }
+        }
 
         // For single-source searches, stream output directly for fast first-result time
         // For multi-file searches, buffer to prevent interleaved output
         if (self.config.is_single_source and !self.config.count_only and !self.config.files_with_matches) {
-            // Streaming path - write matches directly to stdout
-            if (self.pattern_matcher.is_literal and !self.pattern_matcher.word_boundary) {
-                // Literal pattern streaming search
-                const StreamCallback = struct {
-                    out: *output.Output,
-                    path: []const u8,
-                    done: bool,
+            const StreamCallback = struct {
+                out: *output.Output,
+                path: []const u8,
+                pattern_matcher: *const matcher_mod.Matcher,
 
-                    pub fn call(ctx: *@This(), line: reader.StreamingLineReader.Line, match_start: usize, match_end: usize) void {
-                        if (ctx.done) return;
-                        ctx.out.writeMatchDirect(.{
-                            .file_path = ctx.path,
-                            .line_number = line.number,
-                            .line_content = line.content,
-                            .match_start = match_start,
-                            .match_end = match_end,
-                        });
-                    }
-                };
-
-                var callback = StreamCallback{
-                    .out = self.out,
-                    .path = path,
-                    .done = false,
-                };
-
-                if (self.pattern_matcher.ignore_case) {
-                    _ = stream.searchLiteralIgnoreCase(self.pattern_matcher.pattern, &callback);
-                } else {
-                    _ = stream.searchLiteral(self.pattern_matcher.pattern, &callback);
+                pub fn call(ctx: *@This(), line: reader.StreamingLineReader.Line, match_start: usize, match_end: usize) !bool {
+                    try ctx.out.writeMatchDirect(.{
+                        .file_path = ctx.path,
+                        .line_number = line.number,
+                        .line_content = line.content,
+                        .match_start = match_start,
+                        .match_end = match_end,
+                    }, ctx.pattern_matcher);
+                    ctx.out.finishDirectMatch();
+                    return true;
                 }
-            } else if (self.pattern_matcher.is_multi_literal and !self.pattern_matcher.word_boundary) {
-                // Multi-literal pattern streaming search using Aho-Corasick
-                const StreamCallback = struct {
-                    out: *output.Output,
-                    path: []const u8,
-                    done: bool,
+            };
 
-                    pub fn call(ctx: *@This(), line: reader.StreamingLineReader.Line, match_start: usize, match_end: usize) void {
-                        if (ctx.done) return;
-                        ctx.out.writeMatchDirect(.{
-                            .file_path = ctx.path,
-                            .line_number = line.number,
-                            .line_content = line.content,
-                            .match_start = match_start,
-                            .match_end = match_end,
-                        });
-                    }
-                };
-
-                var callback = StreamCallback{
-                    .out = self.out,
-                    .path = path,
-                    .done = false,
-                };
-
-                if (self.pattern_matcher.ac_automaton) |*ac| {
-                    const max_len = self.pattern_matcher.getMaxPatternLen();
-
-                    if (self.pattern_matcher.ignore_case) {
-                        const lower_buf = alloc.alloc(u8, 1024 * 1024) catch {
-                            // Fall back to line-by-line
-                            while (stream.next()) |line| {
-                                if (self.pattern_matcher.findFirst(line.content)) |match_result| {
-                                    callback.call(line, match_result.start, match_result.end);
-                                }
-                            }
-                            return;
-                        };
-                        defer alloc.free(lower_buf);
-                        _ = stream.searchMultiLiteralWithCallback(ac, max_len, &callback, lower_buf, true);
-                    } else {
-                        _ = stream.searchMultiLiteralWithCallback(ac, max_len, &callback, null, false);
-                    }
-                }
-            } else {
-                // Regex pattern streaming search
-                while (stream.next()) |line| {
-                    if (self.pattern_matcher.findFirst(line.content)) |match_result| {
-                        self.out.writeMatchDirect(.{
-                            .file_path = path,
-                            .line_number = line.number,
-                            .line_content = line.content,
-                            .match_start = match_result.start,
-                            .match_end = match_result.end,
-                        });
-                    }
+            var callback = StreamCallback{ .out = self.out, .path = path, .pattern_matcher = self.pattern_matcher };
+            const found = try stream.searchMatcher(
+                self.pattern_matcher,
+                &callback,
+                self.out.lineNumbersEnabled(),
+                self.out.colorEnabled(),
+                true,
+            );
+            try self.out.flushDirect();
+            if (found) {
+                if (stream.binaryByteOffset()) |offset| {
+                    try self.out.printBinaryMessage(path, offset, stream.quitsOnBinary());
                 }
             }
             return;
         }
 
         // Buffered path - for multi-file searches or count/files-with-matches modes
-        var file_buf = output.FileBuffer.init(alloc, self.config, self.out.colorEnabled(), self.out.headingEnabled());
+        // Output can grow larger than the input when every line matches and a
+        // path prefix is added. Keep it out of the reset-only worker arena:
+        // ArrayList growth there retains every superseded allocation until the
+        // file finishes, causing large allocation and RSS spikes on dense data.
+        var file_buf = output.FileBuffer.initResolved(
+            std.heap.smp_allocator,
+            self.config,
+            self.out.colorEnabled(),
+            self.out.headingEnabled(),
+            self.out.lineNumbersEnabled(),
+        );
         defer file_buf.deinit();
 
-        // For literal patterns without word boundary, use buffer-first search (much faster)
-        // This works for both case-sensitive and case-insensitive (-i) patterns
-        if (self.pattern_matcher.is_literal and !self.pattern_matcher.word_boundary) {
-            const Callback = struct {
-                file_buf: *output.FileBuffer,
-                path: []const u8,
-                config: main.Config,
-                files_with_matches: bool,
-                count_only: bool,
-                done: bool,
+        const Callback = struct {
+            file_buf: *output.FileBuffer,
+            path: []const u8,
+            files_with_matches: bool,
+            count_only: bool,
+            pattern_matcher: *const matcher_mod.Matcher,
 
-                pub fn call(ctx: *@This(), line: reader.StreamingLineReader.Line, match_start: usize, match_end: usize) void {
-                    if (ctx.done) return;
-
-                    if (ctx.count_only) {
-                        ctx.file_buf.match_count += 1;
-                    } else {
-                        ctx.file_buf.addMatch(.{
-                            .file_path = ctx.path,
-                            .line_number = line.number,
-                            .line_content = line.content,
-                            .match_start = match_start,
-                            .match_end = match_end,
-                        }) catch {};
-
-                        if (ctx.files_with_matches) {
-                            ctx.done = true;
-                        }
-                    }
+            pub fn call(ctx: *@This(), line: reader.StreamingLineReader.Line, match_start: usize, match_end: usize) !bool {
+                if (ctx.count_only) {
+                    ctx.file_buf.match_count += 1;
+                    return true;
                 }
-            };
 
-            var callback = Callback{
-                .file_buf = &file_buf,
-                .path = path,
-                .config = self.config,
-                .files_with_matches = self.config.files_with_matches,
-                .count_only = self.config.count_only,
-                .done = false,
-            };
-
-            // Use case-insensitive or case-sensitive buffer search based on -i flag
-            if (self.pattern_matcher.ignore_case) {
-                _ = stream.searchLiteralIgnoreCase(self.pattern_matcher.pattern, &callback);
-            } else {
-                _ = stream.searchLiteral(self.pattern_matcher.pattern, &callback);
+                try ctx.file_buf.addMatchWithMatcher(.{
+                    .file_path = ctx.path,
+                    .line_number = line.number,
+                    .line_content = line.content,
+                    .match_start = match_start,
+                    .match_end = match_end,
+                }, ctx.pattern_matcher);
+                return !ctx.files_with_matches;
             }
-        } else if (self.pattern_matcher.is_multi_literal and !self.pattern_matcher.word_boundary) {
-            // For multi-literal patterns without word boundary, use Aho-Corasick buffer search
-            const Callback = struct {
-                file_buf: *output.FileBuffer,
-                path: []const u8,
-                config: main.Config,
-                files_with_matches: bool,
-                count_only: bool,
-                done: bool,
+        };
 
-                pub fn call(ctx: *@This(), line: reader.StreamingLineReader.Line, match_start: usize, match_end: usize) void {
-                    if (ctx.done) return;
-
-                    if (ctx.count_only) {
-                        ctx.file_buf.match_count += 1;
-                    } else {
-                        ctx.file_buf.addMatch(.{
-                            .file_path = ctx.path,
-                            .line_number = line.number,
-                            .line_content = line.content,
-                            .match_start = match_start,
-                            .match_end = match_end,
-                        }) catch {};
-
-                        if (ctx.files_with_matches) {
-                            ctx.done = true;
-                        }
-                    }
-                }
-            };
-
-            var callback = Callback{
-                .file_buf = &file_buf,
-                .path = path,
-                .config = self.config,
-                .files_with_matches = self.config.files_with_matches,
-                .count_only = self.config.count_only,
-                .done = false,
-            };
-
-            // Get the AC automaton from the matcher
-            if (self.pattern_matcher.ac_automaton) |*ac| {
-                const max_len = self.pattern_matcher.getMaxPatternLen();
-
-                // For case-insensitive, we need a lowercase buffer
-                if (self.pattern_matcher.ignore_case) {
-                    // Allocate a lowercase buffer the same size as the stream buffer
-                    const lower_buf = alloc.alloc(u8, 1024 * 1024) catch {
-                        // Fall back to line-by-line if allocation fails
-                        while (stream.next()) |line| {
-                            if (self.pattern_matcher.findFirst(line.content)) |match_result| {
-                                callback.call(line, match_result.start, match_result.end);
-                            }
-                        }
-                        return;
-                    };
-                    defer alloc.free(lower_buf);
-                    _ = stream.searchMultiLiteralWithCallback(ac, max_len, &callback, lower_buf, true);
-                } else {
-                    _ = stream.searchMultiLiteralWithCallback(ac, max_len, &callback, null, false);
-                }
-            }
-        } else {
-            // For regex patterns, use line-by-line search
-            while (stream.next()) |line| {
-                if (self.pattern_matcher.findFirst(line.content)) |match_result| {
-                    if (self.config.count_only) {
-                        file_buf.match_count += 1;
-                    } else {
-                        try file_buf.addMatch(.{
-                            .file_path = path,
-                            .line_number = line.number,
-                            .line_content = line.content,
-                            .match_start = match_result.start,
-                            .match_end = match_result.end,
-                        });
-
-                        if (self.config.files_with_matches) break;
-                    }
-                }
-            }
-        }
+        var callback = Callback{
+            .file_buf = &file_buf,
+            .path = path,
+            .files_with_matches = self.config.files_with_matches,
+            .count_only = self.config.count_only,
+            .pattern_matcher = self.pattern_matcher,
+        };
+        const found = try stream.searchMatcher(
+            self.pattern_matcher,
+            &callback,
+            !self.config.count_only and self.out.lineNumbersEnabled(),
+            self.out.colorEnabled() and !self.config.count_only and !self.config.files_with_matches,
+            !self.config.count_only and !self.config.files_with_matches,
+        );
 
         // Flush all buffered output in one mutex lock
         if (self.config.count_only) {
-            if (file_buf.match_count > 0) {
+            if (file_buf.match_count > 0 and !(stream.isBinary() and stream.quitsOnBinary())) {
                 try self.out.printFileCount(path, file_buf.match_count);
             }
         } else {
             try self.out.flushFileBuffer(&file_buf);
+            if (found and !self.config.files_with_matches) {
+                if (stream.binaryByteOffset()) |offset| {
+                    try self.out.printBinaryMessage(path, offset, stream.quitsOnBinary());
+                }
+            }
         }
     }
 };

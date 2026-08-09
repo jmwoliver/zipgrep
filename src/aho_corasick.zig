@@ -573,9 +573,9 @@ test "AhoCorasick many patterns" {
     const allocator = std.testing.allocator;
     // Test with more patterns to stress the trie
     const patterns = &[_][]const u8{
-        "alpha", "beta",  "gamma", "delta",
-        "epsilon", "zeta", "eta",   "theta",
-        "iota", "kappa", "lambda", "mu",
+        "alpha",   "beta",  "gamma",  "delta",
+        "epsilon", "zeta",  "eta",    "theta",
+        "iota",    "kappa", "lambda", "mu",
     };
 
     var ac = try AhoCorasick.compile(allocator, patterns);

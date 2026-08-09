@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# zipgrep has no databases, background services, or tunnels to repair.
+# The Zig toolchain installed by .agents/setup persists with the orb snapshot.
+command -v zig >/dev/null 2>&1 || {
+	printf 'error: Zig is unavailable; rerun .agents/setup\n' >&2
+	exit 1
+}
+
+printf 'Orb resume complete (Zig %s).\n' "$(zig version)"

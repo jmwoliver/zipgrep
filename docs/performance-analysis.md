@@ -1,4 +1,6 @@
-# zipgrep Performance Analysis and Optimization Plan
+# Historical zipgrep Performance Analysis and Optimization Plan
+
+> **Status:** This is the pre-optimization investigation that motivated the current implementation. Its code references, benchmark assumptions, and list of open bottlenecks are retained as historical context and are no longer current. See the root README and current source for the implemented SIMD, bounded-I/O, regex, scheduling, correctness, and benchmark results.
 
 ## Executive Summary
 

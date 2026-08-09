@@ -1,15 +1,13 @@
 const std = @import("std");
 
-/// A lock-free work-stealing deque based on the Chase-Lev algorithm.
-/// Reference: "Dynamic Circular Work-Stealing Deque" by Chase and Lev
+/// A synchronized work-stealing deque.
 ///
 /// The deque supports:
 /// - Single-owner push/pop from the bottom (LIFO for depth-first traversal)
 /// - Multiple stealers can steal from the top (FIFO from their perspective)
 ///
-/// Memory orderings are carefully chosen to ensure correctness without
-/// unnecessary synchronization overhead.
-
+/// Operations are serialized because work items own heap allocations and a
+/// duplicate claim is a use-after-free, not a recoverable scheduling miss.
 /// Circular buffer backing the deque.
 /// Capacity is always a power of 2 for efficient modulo via bitwise AND.
 pub fn Buffer(comptime T: type) type {
@@ -88,22 +86,17 @@ pub fn StealResult(comptime T: type) type {
 pub fn Deque(comptime T: type) type {
     return struct {
         const Self = @This();
-        const BufferT = Buffer(T);
 
-        /// Bottom index - only modified by owner (Worker)
-        bottom: std.atomic.Value(isize),
-
-        /// Top index - modified by stealers via CAS
-        top: std.atomic.Value(isize),
-
-        /// Current buffer - can be swapped during growth
-        buffer: std.atomic.Value(*BufferT),
-
-        /// Old buffers to be freed (kept until deque is destroyed)
-        garbage: std.ArrayListUnmanaged(*BufferT),
+        /// Live entries occupy items[top..]. The owner pops from the end and
+        /// stealers advance top, preserving Chase-Lev's LIFO/FIFO behavior.
+        items: std.ArrayListUnmanaged(T),
+        top: usize,
 
         /// Allocator for buffer management
         allocator: std.mem.Allocator,
+
+        /// Serializes owner and stealer operations.
+        mutex: std.Thread.Mutex,
 
         /// Minimum buffer capacity
         const MIN_CAPACITY: usize = 64;
@@ -119,31 +112,21 @@ pub fn Deque(comptime T: type) type {
             var capacity = @max(MIN_CAPACITY, requested_capacity);
             capacity = std.math.ceilPowerOfTwo(usize, capacity) catch MIN_CAPACITY;
 
-            const buffer = try BufferT.init(allocator, capacity);
-            errdefer buffer.deinit();
-
             const deque = try allocator.create(Self);
+            errdefer allocator.destroy(deque);
             deque.* = .{
-                .bottom = std.atomic.Value(isize).init(0),
-                .top = std.atomic.Value(isize).init(0),
-                .buffer = std.atomic.Value(*BufferT).init(buffer),
-                .garbage = .{},
+                .items = .{},
+                .top = 0,
                 .allocator = allocator,
+                .mutex = .{},
             };
+            try deque.items.ensureTotalCapacity(allocator, capacity);
             return deque;
         }
 
         /// Destroy the deque and free all resources
         pub fn deinit(self: *Self) void {
-            // Free current buffer
-            self.buffer.load(.monotonic).deinit();
-
-            // Free old buffers
-            for (self.garbage.items) |old_buffer| {
-                old_buffer.deinit();
-            }
-            self.garbage.deinit(self.allocator);
-
+            self.items.deinit(self.allocator);
             self.allocator.destroy(self);
         }
 
@@ -157,19 +140,18 @@ pub fn Deque(comptime T: type) type {
             return .{ .deque = self };
         }
 
-        /// Check if the deque is empty (approximate, may have false positives due to races)
+        /// Check if the deque is empty.
         pub fn isEmpty(self: *Self) bool {
-            const t = self.top.load(.acquire);
-            const b = self.bottom.load(.acquire);
-            return b <= t;
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.top >= self.items.items.len;
         }
 
-        /// Get the current length (approximate, may be stale)
+        /// Get the current length.
         pub fn len(self: *Self) usize {
-            const t = self.top.load(.acquire);
-            const b = self.bottom.load(.acquire);
-            if (b <= t) return 0;
-            return @intCast(b - t);
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.items.items.len - self.top;
         }
     };
 }
@@ -180,70 +162,40 @@ pub fn Worker(comptime T: type) type {
     return struct {
         const Self = @This();
         const DequeT = Deque(T);
-        const BufferT = Buffer(T);
 
         deque: *DequeT,
 
         /// Push an item to the bottom of the deque.
         /// May grow the buffer if needed.
         pub fn push(self: *Self, item: T) !void {
-            const b = self.deque.bottom.load(.monotonic);
-            const t = self.deque.top.load(.acquire);
-            var buffer = self.deque.buffer.load(.monotonic);
+            self.deque.mutex.lock();
+            defer self.deque.mutex.unlock();
 
-            const size = b -% t;
-            if (size >= @as(isize, @intCast(buffer.capacity))) {
-                // Buffer is full, grow it
-                const new_buffer = try buffer.grow(@intCast(@max(0, b)), @intCast(@max(0, t)));
-
-                // Keep old buffer for later cleanup
-                try self.deque.garbage.append(self.deque.allocator, buffer);
-
-                // Store new buffer with release ordering
-                self.deque.buffer.store(new_buffer, .release);
-                buffer = new_buffer;
+            if (self.deque.top == self.deque.items.items.len) {
+                self.deque.items.clearRetainingCapacity();
+                self.deque.top = 0;
+            } else if (self.deque.top >= 1024 and self.deque.top * 2 >= self.deque.items.items.len) {
+                const live = self.deque.items.items[self.deque.top..];
+                std.mem.copyForwards(T, self.deque.items.items[0..live.len], live);
+                self.deque.items.shrinkRetainingCapacity(live.len);
+                self.deque.top = 0;
             }
-
-            // Store item at bottom position
-            buffer.put(@intCast(@mod(b, @as(isize, @intCast(buffer.capacity)))), item);
-
-            // Store with release ordering ensures item is visible before bottom increment
-            self.deque.bottom.store(b +% 1, .release);
+            try self.deque.items.append(self.deque.allocator, item);
         }
 
         /// Pop an item from the bottom of the deque (LIFO).
         /// Returns null if the deque is empty.
         pub fn pop(self: *Self) ?T {
-            const b = self.deque.bottom.load(.monotonic) -% 1;
-            const buffer = self.deque.buffer.load(.monotonic);
+            self.deque.mutex.lock();
+            defer self.deque.mutex.unlock();
 
-            // Decrement bottom
-            self.deque.bottom.store(b, .seq_cst);
-
-            // Load top with seq_cst for synchronization
-            const t = self.deque.top.load(.seq_cst);
-
-            if (t <= b) {
-                // Non-empty, get item
-                const item = buffer.get(@intCast(@mod(b, @as(isize, @intCast(buffer.capacity)))));
-
-                if (t == b) {
-                    // This was the last item - race with stealers possible
-                    // Try to claim it via CAS on top
-                    if (self.deque.top.cmpxchgStrong(t, t +% 1, .seq_cst, .monotonic)) |_| {
-                        // CAS failed - a stealer got it
-                        self.deque.bottom.store(t +% 1, .monotonic);
-                        return null;
-                    }
-                    self.deque.bottom.store(t +% 1, .monotonic);
-                }
-
-                return item;
-            } else {
-                // Empty - restore bottom
-                self.deque.bottom.store(t, .monotonic);
-                return null;
+            if (self.deque.top >= self.deque.items.items.len) return null;
+            const item = self.deque.items.pop().?;
+            if (self.deque.top == self.deque.items.items.len) {
+                self.deque.items.clearRetainingCapacity();
+                self.deque.top = 0;
             }
+            return item;
         }
     };
 }
@@ -254,35 +206,22 @@ pub fn Stealer(comptime T: type) type {
     return struct {
         const Self = @This();
         const DequeT = Deque(T);
-        const BufferT = Buffer(T);
         const Result = StealResult(T);
 
         deque: *DequeT,
 
         /// Attempt to steal an item from the top of the deque.
         pub fn steal(self: *Self) Result {
-            // Load top with acquire
-            const t = self.deque.top.load(.acquire);
+            self.deque.mutex.lock();
+            defer self.deque.mutex.unlock();
 
-            // Load bottom with seq_cst to ensure proper ordering with top
-            // This acts as a full fence between the two loads
-            const b = self.deque.bottom.load(.seq_cst);
-
-            if (t >= b) {
-                return .empty;
+            if (self.deque.top >= self.deque.items.items.len) return .empty;
+            const item = self.deque.items.items[self.deque.top];
+            self.deque.top += 1;
+            if (self.deque.top == self.deque.items.items.len) {
+                self.deque.items.clearRetainingCapacity();
+                self.deque.top = 0;
             }
-
-            // Non-empty, try to steal from top
-            const buffer = self.deque.buffer.load(.acquire);
-            const item = buffer.get(@intCast(@mod(t, @as(isize, @intCast(buffer.capacity)))));
-
-            // CAS to increment top (claim the item)
-            if (self.deque.top.cmpxchgStrong(t, t +% 1, .seq_cst, .monotonic)) |_| {
-                // CAS failed - another stealer won or owner popped
-                return .retry;
-            }
-
-            // Successfully stolen
             return .{ .success = item };
         }
 

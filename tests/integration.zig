@@ -115,6 +115,22 @@ test "integration: files only mode" {
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "appears here") == null);
 }
 
+test "integration: quiet mode returns match status without output" {
+    const allocator = std.testing.allocator;
+
+    const matched = try runZipgrep(allocator, &.{ "-q", "PATTERN", "tests/fixtures/" });
+    defer allocator.free(matched.stdout);
+    defer allocator.free(matched.stderr);
+    try std.testing.expectEqual(@as(u8, 0), matched.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), matched.stdout.len);
+
+    const absent = try runZipgrep(allocator, &.{ "-q", "ABSENT_7F91", "tests/fixtures/" });
+    defer allocator.free(absent.stdout);
+    defer allocator.free(absent.stderr);
+    try std.testing.expectEqual(@as(u8, 1), absent.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), absent.stdout.len);
+}
+
 test "integration: hidden files excluded by default" {
     const allocator = std.testing.allocator;
 
@@ -240,15 +256,18 @@ test "integration: no-heading format" {
     try std.testing.expect(found_sample);
 }
 
-test "integration: binary files skipped" {
+test "integration: explicit binary files report matches" {
     const allocator = std.testing.allocator;
 
     const result = try runZipgrep(allocator, &.{ "PATTERN", "tests/fixtures/binary.bin" });
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    // Binary file should be skipped, so no output
-    try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
+    try std.testing.expectEqualStrings(
+        "binary file matches (found \"\\0\" byte around offset 16)\n",
+        result.stdout,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
 test "integration: help flag" {
@@ -1372,4 +1391,29 @@ test "integration: alternation special chars in patterns" {
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "CONFIG_DEBUG_123") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "FLAG_VERBOSE_456") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "OPT_TRACE_789") != null);
+}
+
+test "integration: one worker preserves explicit source order" {
+    const allocator = std.testing.allocator;
+    const temp_dir = "/tmp/zipgrep_explicit_source_order";
+    const first_path = temp_dir ++ "/first.txt";
+    const second_path = temp_dir ++ "/second.txt";
+
+    std.fs.cwd().deleteTree(temp_dir) catch {};
+    try std.fs.cwd().makePath(temp_dir);
+    defer std.fs.cwd().deleteTree(temp_dir) catch {};
+    {
+        const first = try std.fs.cwd().createFile(first_path, .{});
+        defer first.close();
+        try first.writeAll("ORDER_MATCH first\n");
+        const second = try std.fs.cwd().createFile(second_path, .{});
+        defer second.close();
+        try second.writeAll("ORDER_MATCH second\n");
+    }
+
+    var result = try runZipgrep(allocator, &.{ "-j", "1", "ORDER_MATCH", first_path, second_path });
+    defer result.deinit(allocator);
+    const first_offset = std.mem.indexOf(u8, result.stdout, first_path).?;
+    const second_offset = std.mem.indexOf(u8, result.stdout, second_path).?;
+    try std.testing.expect(first_offset < second_offset);
 }

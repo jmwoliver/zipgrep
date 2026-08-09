@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly ZIG_VERSION="0.15.2"
+readonly BIN_DIR="${HOME}/.local/bin"
+readonly INSTALL_DIR="${HOME}/.local/share/zig/${ZIG_VERSION}"
+
+step() {
+	local label="$1"
+	shift
+	local start=$SECONDS
+	printf '==> %s\n' "$label"
+	"$@"
+	printf '    completed in %ss\n' "$((SECONDS - start))"
+}
+
+install_system_packages() {
+	local packages=()
+	command -v curl >/dev/null 2>&1 || packages+=(curl ca-certificates)
+	command -v tar >/dev/null 2>&1 || packages+=(tar)
+	command -v xz >/dev/null 2>&1 || packages+=(xz-utils)
+
+	if ((${#packages[@]} == 0)); then
+		printf '    curl, tar, and xz are already available\n'
+		return
+	fi
+
+	local apt=(apt-get)
+	if ((EUID != 0)); then
+		command -v sudo >/dev/null 2>&1 || {
+			printf 'error: missing required packages and sudo is unavailable\n' >&2
+			exit 1
+		}
+		apt=(sudo apt-get)
+	fi
+
+	"${apt[@]}" update
+	DEBIAN_FRONTEND=noninteractive "${apt[@]}" install -y --no-install-recommends "${packages[@]}"
+}
+
+install_zig() (
+	if [[ -x "${INSTALL_DIR}/zig" ]] && [[ "$("${INSTALL_DIR}/zig" version)" == "$ZIG_VERSION" ]]; then
+		printf '    Zig %s is already installed\n' "$ZIG_VERSION"
+		return
+	fi
+
+	local zig_arch archive_sha
+	case "$(uname -m)" in
+		x86_64)
+			zig_arch="x86_64"
+			archive_sha="02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239"
+			;;
+		aarch64|arm64)
+			zig_arch="aarch64"
+			archive_sha="958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f"
+			;;
+		*)
+			printf 'error: unsupported architecture: %s\n' "$(uname -m)" >&2
+			exit 1
+			;;
+	esac
+
+	local archive_url="https://ziglang.org/download/${ZIG_VERSION}/zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz"
+	local tmp_dir
+	tmp_dir="$(mktemp -d)"
+	trap 'rm -rf -- "$tmp_dir"' EXIT
+
+	curl --fail --location --retry 3 --output "${tmp_dir}/zig.tar.xz" "$archive_url"
+	printf '%s  %s\n' "$archive_sha" "${tmp_dir}/zig.tar.xz" | sha256sum --check --status
+	mkdir -p "${tmp_dir}/unpacked" "$(dirname "$INSTALL_DIR")"
+	tar -xJf "${tmp_dir}/zig.tar.xz" --strip-components=1 -C "${tmp_dir}/unpacked"
+	rm -rf -- "$INSTALL_DIR"
+	mv "${tmp_dir}/unpacked" "$INSTALL_DIR"
+	printf '    installed Zig %s for %s\n' "$ZIG_VERSION" "$zig_arch"
+)
+
+configure_path() {
+	mkdir -p "$BIN_DIR"
+	ln -sfn "${INSTALL_DIR}/zig" "${BIN_DIR}/zig"
+
+	local profile="${HOME}/.bash_profile"
+	local marker="# zipgrep orb toolchain"
+	touch "$profile"
+	if ! grep -Fqx "$marker" "$profile"; then
+		cat >>"$profile" <<'EOF'
+
+# zipgrep orb toolchain
+case ":${PATH}:" in
+	*:"${HOME}/.local/bin":*) ;;
+	*) export PATH="${HOME}/.local/bin:${PATH}" ;;
+esac
+EOF
+	fi
+}
+
+step "Check system packages" install_system_packages
+step "Install Zig ${ZIG_VERSION}" install_zig
+step "Expose Zig to login shells" configure_path
+
+export PATH="${BIN_DIR}:${PATH}"
+[[ "$(zig version)" == "$ZIG_VERSION" ]]
+printf 'Orb setup complete (Zig %s).\n' "$ZIG_VERSION"

@@ -24,14 +24,60 @@ pub const LiteralInfo = struct {
 /// 2. Suffix literals (second best - search backwards or verify end)
 /// 3. Inner literals (still helps - quick reject lines without the literal)
 pub fn extractBestLiteral(pattern: []const u8) ?LiteralInfo {
+    // A literal from only one alternation branch is not required. The matcher
+    // has dedicated exact handling for flat literal/fixed-width alternatives;
+    // all other alternations conservatively skip this line-level prefilter.
+    var escaped = false;
+    var has_counted_repetition = false;
+    for (pattern) |byte| {
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (byte == '\\') {
+            escaped = true;
+        } else if (byte == '|') {
+            return null;
+        } else if (byte == '{') {
+            has_counted_repetition = true;
+        }
+    }
+
+    // An exact repeated pure-literal group always starts at one occurrence of
+    // that literal. This makes `(ab){2,}` as filterable as a normal prefix
+    // while the regex engine still verifies the repetition count.
+    if (extractCountedGroupLiteral(pattern)) |group| {
+        return .{ .literal = group.literal, .position = .prefix, .min_offset = 0 };
+    }
+
     // Try prefix first (most efficient)
     if (extractLiteralPrefix(pattern)) |prefix| {
+        // For a separated `prefix.*suffix`, both literals are required. Prefer
+        // an equally selective suffix: it avoids verifying every occurrence
+        // of a common prefix when the suffix is absent, while retaining the
+        // prefix for patterns where its score is clearly stronger.
+        if (std.mem.indexOf(u8, pattern, ".*") != null) {
+            if (extractLiteralSuffix(pattern)) |suffix| {
+                if (scoreLiteral(suffix) >= scoreLiteral(prefix)) {
+                    return LiteralInfo{
+                        .literal = suffix,
+                        .position = .suffix,
+                        .min_offset = 0,
+                    };
+                }
+            }
+        }
         return LiteralInfo{
             .literal = prefix,
             .position = .prefix,
             .min_offset = 0,
         };
     }
+
+    // Prefix extraction above explicitly excludes an optionally repeated last
+    // byte. More general counted forms need structural literal analysis before
+    // a suffix/inner substring can safely be called required.
+    if (has_counted_repetition) return null;
 
     // Try suffix second
     if (extractLiteralSuffix(pattern)) |suffix| {
@@ -44,6 +90,46 @@ pub fn extractBestLiteral(pattern: []const u8) ?LiteralInfo {
 
     // Try inner literals
     return extractBestInnerLiteral(pattern);
+}
+
+pub const CountedGroupLiteral = struct {
+    literal: []const u8,
+    minimum: usize,
+    maximum: ?usize,
+};
+
+pub fn extractCountedGroupLiteral(pattern: []const u8) ?CountedGroupLiteral {
+    if (pattern.len < 7 or pattern[0] != '(') return null;
+    const close = std.mem.indexOfScalar(u8, pattern, ')') orelse return null;
+    const group = pattern[1..close];
+    if (group.len < 2 or close + 3 >= pattern.len or pattern[close + 1] != '{' or pattern[pattern.len - 1] != '}') return null;
+    for (group) |byte| if (isMetachar(byte)) return null;
+
+    var pos = close + 2;
+    if (pos >= pattern.len or !std.ascii.isDigit(pattern[pos])) return null;
+    var minimum: usize = 0;
+    while (pos < pattern.len and std.ascii.isDigit(pattern[pos])) : (pos += 1) {
+        minimum = std.math.mul(usize, minimum, 10) catch return null;
+        minimum = std.math.add(usize, minimum, pattern[pos] - '0') catch return null;
+    }
+    if (minimum == 0 or pos >= pattern.len) return null;
+    var maximum: ?usize = minimum;
+    if (pattern[pos] == ',') {
+        pos += 1;
+        if (pos == pattern.len - 1) {
+            maximum = null;
+        } else {
+            var parsed_maximum: usize = 0;
+            while (pos < pattern.len and std.ascii.isDigit(pattern[pos])) : (pos += 1) {
+                parsed_maximum = std.math.mul(usize, parsed_maximum, 10) catch return null;
+                parsed_maximum = std.math.add(usize, parsed_maximum, pattern[pos] - '0') catch return null;
+            }
+            if (parsed_maximum < minimum) return null;
+            maximum = parsed_maximum;
+        }
+    }
+    if (pos != pattern.len - 1) return null;
+    return .{ .literal = group, .minimum = minimum, .maximum = maximum };
 }
 
 /// Extract literal prefix from a regex pattern (before any metacharacters)
@@ -69,8 +155,9 @@ fn extractLiteralPrefix(pattern: []const u8) ?[]const u8 {
         }
     }
 
-    var end: usize = 0;
-    var i: usize = 0;
+    const literal_start: usize = if (pattern[0] == '^') 1 else 0;
+    var end: usize = literal_start;
+    var i: usize = literal_start;
 
     while (i < pattern.len) {
         const c = pattern[i];
@@ -84,7 +171,9 @@ fn extractLiteralPrefix(pattern: []const u8) ?[]const u8 {
             },
             else => {
                 // Check if this char is followed by * or ? (makes it optional)
-                if (i + 1 < pattern.len and (pattern[i + 1] == '*' or pattern[i + 1] == '?')) {
+                if (i + 1 < pattern.len and (pattern[i + 1] == '*' or
+                    pattern[i + 1] == '?' or countedRepeatCanBeEmpty(pattern, i + 1)))
+                {
                     // This char is optional, can't include it in required prefix
                     break;
                 }
@@ -95,10 +184,23 @@ fn extractLiteralPrefix(pattern: []const u8) ?[]const u8 {
     }
 
     // Need at least 2 characters for useful prefix
-    if (end >= 2) {
-        return pattern[0..end];
+    if (end - literal_start >= 2) {
+        return pattern[literal_start..end];
     }
     return null;
+}
+
+fn countedRepeatCanBeEmpty(pattern: []const u8, start: usize) bool {
+    if (start >= pattern.len or pattern[start] != '{') return false;
+    var pos = start + 1;
+    if (pos >= pattern.len or !std.ascii.isDigit(pattern[pos])) return false;
+    var minimum: usize = 0;
+    while (pos < pattern.len and std.ascii.isDigit(pattern[pos])) : (pos += 1) {
+        minimum = std.math.mul(usize, minimum, 10) catch return false;
+        minimum = std.math.add(usize, minimum, pattern[pos] - '0') catch return false;
+    }
+    if (pos >= pattern.len or (pattern[pos] != '}' and pattern[pos] != ',')) return false;
+    return minimum == 0;
 }
 
 /// Extract literal suffix from a regex pattern (after any metacharacters)
@@ -390,8 +492,10 @@ fn scoreLiteral(lit: []const u8) u32 {
             // Numbers - somewhat uncommon in prose
             '0'...'9' => score += 2,
             // Very common letters - no bonus
-            'e', 't', 'a', 'o', 'i', 'n', 's', ' ' => {},
-            // Other lowercase letters - small bonus
+            'e', 't', 'a', 'o', 'i', 'n', 's', 'r', 'h', 'l', ' ' => {},
+            // Less common lowercase letters
+            'd', 'c', 'u', 'm', 'f', 'p', 'g', 'w', 'y', 'b' => score += 1,
+            'v', 'k' => score += 2,
             else => score += 1,
         }
     }
@@ -420,6 +524,32 @@ test "extract prefix from CONFIG_.*" {
     try std.testing.expect(info != null);
     try std.testing.expectEqualStrings("CONFIG_", info.?.literal);
     try std.testing.expectEqual(LiteralInfo.Position.prefix, info.?.position);
+}
+
+test "extract prefix after line anchor" {
+    const info = extractBestLiteral("^Sherlock").?;
+    try std.testing.expectEqualStrings("Sherlock", info.literal);
+    try std.testing.expectEqual(LiteralInfo.Position.prefix, info.position);
+}
+
+test "counted optional byte is excluded from required prefix" {
+    const info = extractBestLiteral("prefix{0,2}SUFFIX").?;
+    try std.testing.expectEqualStrings("prefi", info.literal);
+    try std.testing.expectEqual(LiteralInfo.Position.prefix, info.position);
+}
+
+test "extract selective suffix from separated literals" {
+    const info = extractBestLiteral("alpha.*omega").?;
+    try std.testing.expectEqualStrings("omega", info.literal);
+    try std.testing.expectEqual(LiteralInfo.Position.suffix, info.position);
+}
+
+test "extract prefix from counted literal group" {
+    const info = extractBestLiteral("(ab){2,}").?;
+    try std.testing.expectEqualStrings("ab", info.literal);
+    try std.testing.expectEqual(LiteralInfo.Position.prefix, info.position);
+    try std.testing.expect(extractBestLiteral("(a.){2,}") == null);
+    try std.testing.expect(extractBestLiteral("(ab){0,3}") == null);
 }
 
 test "extract inner from [a-z]+_FOO_[a-z]+" {
@@ -514,90 +644,49 @@ pub const AlternationInfo = struct {
 pub fn extractAlternationLiterals(allocator: std.mem.Allocator, pattern: []const u8) !?AlternationInfo {
     if (pattern.len == 0) return null;
 
-    // Quick check: must contain at least one '|' at top level
-    var has_alternation = false;
-    var paren_depth: usize = 0;
-    var bracket_depth: usize = 0;
-    for (pattern) |c| {
-        switch (c) {
-            '(' => paren_depth += 1,
-            ')' => if (paren_depth > 0) {
-                paren_depth -= 1;
-            },
-            '[' => bracket_depth += 1,
-            ']' => if (bracket_depth > 0) {
-                bracket_depth -= 1;
-            },
-            '|' => if (paren_depth == 0 and bracket_depth == 0) {
-                has_alternation = true;
-                break;
-            },
-            else => {},
-        }
-    }
-    if (!has_alternation) return null;
-
-    // Parse and validate each alternative
     var literals = std.ArrayListUnmanaged([]const u8){};
-    errdefer {
+    defer {
         for (literals.items) |lit| allocator.free(lit);
         literals.deinit(allocator);
     }
 
     var ascii_only = true;
     var start: usize = 0;
-    paren_depth = 0;
-    bracket_depth = 0;
-
-    for (pattern, 0..) |c, i| {
-        switch (c) {
-            '(' => paren_depth += 1,
-            ')' => if (paren_depth > 0) {
-                paren_depth -= 1;
-            },
-            '[' => bracket_depth += 1,
-            ']' => if (bracket_depth > 0) {
-                bracket_depth -= 1;
-            },
-            '|' => {
-                if (paren_depth == 0 and bracket_depth == 0) {
-                    const alt = pattern[start..i];
-                    if (alt.len == 0 or !isPureLiteral(alt)) {
-                        // Not a pure literal - abort
-                        for (literals.items) |lit| allocator.free(lit);
-                        literals.deinit(allocator);
-                        return null;
-                    }
-                    const owned = try allocator.dupe(u8, alt);
-                    try literals.append(allocator, owned);
-                    for (alt) |ch| {
-                        if (ch >= 0x80) ascii_only = false;
-                    }
-                    start = i + 1;
-                }
-            },
-            else => {},
+    var escaped = false;
+    for (pattern, 0..) |byte, i| {
+        if (escaped) {
+            escaped = false;
+            continue;
         }
-    }
+        if (byte == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (byte != '|') continue;
 
-    // Handle final alternative
-    const last_alt = pattern[start..];
-    if (last_alt.len == 0 or !isPureLiteral(last_alt)) {
-        for (literals.items) |lit| allocator.free(lit);
-        literals.deinit(allocator);
-        return null;
+        const alternative = pattern[start..i];
+        if (alternative.len == 0) return null;
+        const decoded = try decodePureLiteral(allocator, alternative) orelse return null;
+        literals.append(allocator, decoded) catch |err| {
+            allocator.free(decoded);
+            return err;
+        };
+        for (decoded) |decoded_byte| {
+            if (decoded_byte >= 0x80) ascii_only = false;
+        }
+        start = i + 1;
     }
-    const owned_last = try allocator.dupe(u8, last_alt);
-    try literals.append(allocator, owned_last);
-    for (last_alt) |ch| {
-        if (ch >= 0x80) ascii_only = false;
-    }
+    if (start == 0) return null;
 
-    if (literals.items.len < 2) {
-        // Need at least 2 alternatives
-        for (literals.items) |lit| allocator.free(lit);
-        literals.deinit(allocator);
-        return null;
+    const final_alternative = pattern[start..];
+    if (final_alternative.len == 0) return null;
+    const decoded = try decodePureLiteral(allocator, final_alternative) orelse return null;
+    literals.append(allocator, decoded) catch |err| {
+        allocator.free(decoded);
+        return err;
+    };
+    for (decoded) |decoded_byte| {
+        if (decoded_byte >= 0x80) ascii_only = false;
     }
 
     return AlternationInfo{
@@ -607,13 +696,136 @@ pub fn extractAlternationLiterals(allocator: std.mem.Allocator, pattern: []const
     };
 }
 
-/// Check if a string is a pure literal (no regex metacharacters)
-fn isPureLiteral(s: []const u8) bool {
-    if (s.len == 0) return false;
-    for (s) |c| {
-        if (isMetachar(c)) return false;
+/// Extract `(literal|literal|...)+`. Every match contains at least one full
+/// alternative, so the set is a sound prefilter; the regex engine still
+/// verifies the candidate to recover repetition and branch semantics.
+pub fn extractRepeatedAlternationLiterals(allocator: std.mem.Allocator, pattern: []const u8) !?AlternationInfo {
+    if (pattern.len < 5 or pattern[0] != '(' or pattern[pattern.len - 2] != ')' or pattern[pattern.len - 1] != '+') {
+        return null;
     }
-    return true;
+    return extractAlternationLiterals(allocator, pattern[1 .. pattern.len - 2]);
+}
+
+fn decodePureLiteral(allocator: std.mem.Allocator, pattern: []const u8) !?[]u8 {
+    var decoded = std.ArrayListUnmanaged(u8){};
+    defer decoded.deinit(allocator);
+
+    var pos: usize = 0;
+    while (pos < pattern.len) : (pos += 1) {
+        const byte = pattern[pos];
+        if (byte != '\\') {
+            if (isMetachar(byte)) return null;
+            try decoded.append(allocator, byte);
+            continue;
+        }
+
+        pos += 1;
+        if (pos >= pattern.len) return null;
+        const literal_byte: u8 = switch (pattern[pos]) {
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            '\\', '.', '[', ']', '(', ')', '{', '}', '*', '+', '?', '|', '^', '$', '-' => pattern[pos],
+            else => return null,
+        };
+        try decoded.append(allocator, literal_byte);
+    }
+    return try decoded.toOwnedSlice(allocator);
+}
+
+pub const FixedAlternationBranch = struct {
+    pattern: []const u8,
+    required_literal: []const u8,
+    required_offset: usize,
+};
+
+/// A flat alternation of fixed-width branches. Branch and literal bytes borrow
+/// from the pattern supplied to `extractFixedAlternation`; only the two slices
+/// of metadata are owned here.
+pub const FixedAlternationInfo = struct {
+    branches: []const FixedAlternationBranch,
+    required_literals: []const []const u8,
+    max_required_offset: usize,
+    max_branch_len: usize,
+    ascii_only: bool,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *FixedAlternationInfo) void {
+        self.allocator.free(self.branches);
+        self.allocator.free(self.required_literals);
+    }
+};
+
+/// Extract every branch of a flat alternation whose only non-literal token is
+/// `.` (exactly one non-newline byte). A selective literal is retained for
+/// finding candidates, while the complete fixed-width branch is retained so a
+/// match can be verified directly without entering the general NFA/DFA engine.
+/// Quantifiers, classes, escapes and groups deliberately fall back to regex.
+pub fn extractFixedAlternation(allocator: std.mem.Allocator, pattern: []const u8) !?FixedAlternationInfo {
+    if (std.mem.indexOfScalar(u8, pattern, '|') == null) return null;
+
+    var branches = std.ArrayListUnmanaged(FixedAlternationBranch){};
+    defer branches.deinit(allocator);
+    var literals = std.ArrayListUnmanaged([]const u8){};
+    defer literals.deinit(allocator);
+    var max_required_offset: usize = 0;
+    var max_branch_len: usize = 0;
+    var ascii_only = true;
+
+    var alternatives = std.mem.splitScalar(u8, pattern, '|');
+    while (alternatives.next()) |alternative| {
+        if (alternative.len == 0) return null;
+
+        var best: []const u8 = "";
+        var best_offset: usize = 0;
+        var run_start: usize = 0;
+        for (alternative, 0..) |byte, i| {
+            if (byte == '.') {
+                if (i - run_start > best.len) {
+                    best = alternative[run_start..i];
+                    best_offset = run_start;
+                }
+                run_start = i + 1;
+            } else if (isMetachar(byte)) {
+                return null;
+            }
+        }
+        const prefix_end = std.mem.indexOfScalar(u8, alternative, '.') orelse alternative.len;
+        if (prefix_end >= 3) {
+            best = alternative[0..prefix_end];
+            best_offset = 0;
+        } else if (alternative.len - run_start > best.len) {
+            best = alternative[run_start..];
+            best_offset = run_start;
+        }
+        if (best.len < 2) return null;
+
+        try branches.append(allocator, .{
+            .pattern = alternative,
+            .required_literal = best,
+            .required_offset = best_offset,
+        });
+        try literals.append(allocator, best);
+        for (alternative) |byte| {
+            if (byte >= 0x80) ascii_only = false;
+        }
+        if (branches.items.len > 8) return null;
+        max_required_offset = @max(max_required_offset, best_offset);
+        max_branch_len = @max(max_branch_len, alternative.len);
+    }
+
+    if (branches.items.len < 2) return null;
+    const owned_branches = try branches.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_branches);
+    const owned_literals = try literals.toOwnedSlice(allocator);
+    return .{
+        .branches = owned_branches,
+        .required_literals = owned_literals,
+        .max_required_offset = max_required_offset,
+        .max_branch_len = max_branch_len,
+        .ascii_only = ascii_only,
+        .allocator = allocator,
+    };
 }
 
 // =============================================================================
@@ -632,6 +844,26 @@ test "extractAlternationLiterals pure literals" {
     try std.testing.expect(info.ascii_only);
 }
 
+test "extract fixed alternation required literals" {
+    const allocator = std.testing.allocator;
+    var info = (try extractFixedAlternation(allocator, "Sherlock Holmes|John Watson|Professor Moriarty|Mrs. Hudson")).?;
+    defer info.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), info.branches.len);
+    try std.testing.expectEqualStrings("Sherlock Holmes", info.required_literals[0]);
+    try std.testing.expectEqualStrings("John Watson", info.required_literals[1]);
+    try std.testing.expectEqualStrings("Professor Moriarty", info.required_literals[2]);
+    try std.testing.expectEqualStrings("Mrs", info.required_literals[3]);
+    try std.testing.expectEqual(@as(usize, 0), info.branches[3].required_offset);
+    try std.testing.expectEqualStrings("Mrs. Hudson", info.branches[3].pattern);
+}
+
+test "fixed alternation rejects optional branches" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect((try extractFixedAlternation(allocator, "foo.*|bar")) == null);
+    try std.testing.expect((try extractFixedAlternation(allocator, "foo|ba[rz]")) == null);
+}
+
 test "extractAlternationLiterals benchmark pattern" {
     const allocator = std.testing.allocator;
     var info = (try extractAlternationLiterals(allocator, "ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT")).?;
@@ -642,6 +874,32 @@ test "extractAlternationLiterals benchmark pattern" {
     try std.testing.expectEqualStrings("PME_TURN_OFF", info.literals[1]);
     try std.testing.expectEqualStrings("LINK_REQ_RST", info.literals[2]);
     try std.testing.expectEqualStrings("CFG_BME_EVT", info.literals[3]);
+}
+
+test "extractAlternationLiterals decodes escaped literals" {
+    const allocator = std.testing.allocator;
+    var info = (try extractAlternationLiterals(allocator, "foo\\.bar|left\\|right|line\\tend")).?;
+    defer info.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), info.literals.len);
+    try std.testing.expectEqualStrings("foo.bar", info.literals[0]);
+    try std.testing.expectEqualStrings("left|right", info.literals[1]);
+    try std.testing.expectEqualStrings("line\tend", info.literals[2]);
+}
+
+test "extractAlternationLiterals rejects escaped classes" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect((try extractAlternationLiterals(allocator, "foo\\d|bar")) == null);
+    try std.testing.expect((try extractAlternationLiterals(allocator, "foo\\|bar")) == null);
+}
+
+test "extract repeated literal alternation" {
+    const allocator = std.testing.allocator;
+    var info = (try extractRepeatedAlternationLiterals(allocator, "(Sherlock|John)+")).?;
+    defer info.deinit();
+    try std.testing.expectEqualStrings("Sherlock", info.literals[0]);
+    try std.testing.expectEqualStrings("John", info.literals[1]);
+    try std.testing.expect((try extractRepeatedAlternationLiterals(allocator, "(Sherlock|J.hn)+")) == null);
 }
 
 test "extractAlternationLiterals with regex returns null" {

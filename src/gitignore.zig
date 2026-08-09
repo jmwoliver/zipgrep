@@ -8,30 +8,46 @@ const Pattern = struct {
     directory_only: bool,
     anchored: bool, // Pattern is relative to gitignore location
     contains_slash: bool, // Pattern contains a slash (besides leading/trailing)
+    required_last_byte: ?u8,
 
-    /// Match a path against this pattern
-    /// The path should be relative to the search root (not absolute)
-    fn matches(self: *const Pattern, path: []const u8, is_dir: bool) bool {
+    fn matchesRelative(self: *const Pattern, rel_path: []const u8, basename: []const u8, is_dir: bool) bool {
         // If pattern is directory-only, only match directories
-        if (self.directory_only and !is_dir) {
-            return false;
-        }
-
-        // Get path relative to pattern's root
-        const rel_path = getRelativePath(path, self.root) orelse return false;
+        if (self.directory_only and !is_dir) return false;
         if (rel_path.len == 0) return false;
 
         // If pattern is anchored or contains a slash, match against the full relative path
         // Otherwise, match against basename only
-        if (self.anchored or self.contains_slash) {
-            return globMatch(self.pattern, rel_path);
-        } else {
-            // Match against any path component
-            const basename = std.fs.path.basename(rel_path);
-            return globMatch(self.pattern, basename);
+        const target = if (self.anchored or self.contains_slash) rel_path else basename;
+        if (self.required_last_byte) |last| {
+            if (target.len == 0 or target[target.len - 1] != last) return false;
         }
+        return globMatch(self.pattern, target);
     }
 };
+
+fn applyPatterns(patterns: []const Pattern, path: []const u8, is_dir: bool, initial: bool) bool {
+    var ignored = initial;
+    var active_root_ptr: ?[*]const u8 = null;
+    var rel_path: ?[]const u8 = null;
+    var basename: []const u8 = "";
+
+    for (patterns) |*pattern| {
+        // Patterns loaded from one ignore file share an interned root. Avoid
+        // normalizing the same path and scanning for its basename per rule.
+        if (active_root_ptr == null or active_root_ptr.? != pattern.root.ptr) {
+            active_root_ptr = pattern.root.ptr;
+            rel_path = getRelativePath(path, pattern.root);
+            basename = if (rel_path) |rel| std.fs.path.basename(rel) else "";
+        }
+
+        if (rel_path) |rel| {
+            if (pattern.matchesRelative(rel, basename, is_dir)) {
+                ignored = !pattern.negated;
+            }
+        }
+    }
+    return ignored;
+}
 
 /// Get path relative to root (returns null if path is not under root)
 fn getRelativePath(path: []const u8, root: []const u8) ?[]const u8 {
@@ -209,6 +225,17 @@ fn patternContainsSlash(pattern: []const u8) bool {
         }
     }
     return false;
+}
+
+/// A final literal is a necessary condition for a glob match and makes a very
+/// cheap discriminator for extension-heavy ignore files. Character classes and
+/// trailing wildcards cannot supply one.
+fn requiredLastByte(pattern: []const u8) ?u8 {
+    if (pattern.len == 0) return null;
+    return switch (pattern[pattern.len - 1]) {
+        '*', '?', ']', '\\' => null,
+        else => |last| last,
+    };
 }
 
 const main = @import("main.zig");
@@ -392,11 +419,23 @@ pub const GitignoreMatcher = struct {
 
         // Store pattern string
         const stored_pattern = try self.allocator.dupe(u8, pattern);
-        try self.pattern_storage.append(self.allocator, stored_pattern);
+        self.pattern_storage.append(self.allocator, stored_pattern) catch |err| {
+            self.allocator.free(stored_pattern);
+            return err;
+        };
 
-        // Store root directory
-        const stored_root = try self.allocator.dupe(u8, root_dir);
-        try self.root_storage.append(self.allocator, stored_root);
+        // Consecutive patterns from one file share their root. Besides reducing
+        // memory, pointer identity lets matching compute a relative path once.
+        const stored_root = if (self.root_storage.items.len > 0 and std.mem.eql(u8, self.root_storage.items[self.root_storage.items.len - 1], root_dir))
+            self.root_storage.items[self.root_storage.items.len - 1]
+        else blk: {
+            const root = try self.allocator.dupe(u8, root_dir);
+            self.root_storage.append(self.allocator, root) catch |err| {
+                self.allocator.free(root);
+                return err;
+            };
+            break :blk root;
+        };
 
         try self.patterns.append(self.allocator, .{
             .pattern = stored_pattern,
@@ -405,6 +444,7 @@ pub const GitignoreMatcher = struct {
             .directory_only = directory_only,
             .anchored = anchored,
             .contains_slash = contains_slash,
+            .required_last_byte = requiredLastByte(pattern),
         });
     }
 
@@ -412,15 +452,7 @@ pub const GitignoreMatcher = struct {
     /// path should be relative to the search root
     /// is_dir indicates if the path is a directory
     pub fn isIgnored(self: *const GitignoreMatcher, path: []const u8, is_dir: bool) bool {
-        var ignored = false;
-
-        for (self.patterns.items) |*pattern| {
-            if (pattern.matches(path, is_dir)) {
-                ignored = !pattern.negated;
-            }
-        }
-
-        return ignored;
+        return applyPatterns(self.patterns.items, path, is_dir, false);
     }
 
     /// Simplified check for paths (assumes file, not directory)
@@ -462,6 +494,10 @@ pub const GitignoreState = struct {
     /// Reference to the shared base patterns (immutable, not owned)
     base: ?*const GitignoreMatcher,
 
+    /// Optional inherited state. Parallel directory jobs use this to share an
+    /// immutable chain of ancestor patterns instead of cloning or reloading it.
+    parent: ?*const GitignoreState,
+
     /// Additional local patterns specific to this state (owned)
     local_patterns: std.ArrayListUnmanaged(Pattern),
     local_pattern_storage: std.ArrayListUnmanaged([]u8),
@@ -474,6 +510,7 @@ pub const GitignoreState = struct {
     pub fn init(allocator: std.mem.Allocator, base: ?*const GitignoreMatcher) GitignoreState {
         return .{
             .base = base,
+            .parent = null,
             .local_patterns = .{},
             .local_pattern_storage = .{},
             .local_root_storage = .{},
@@ -487,6 +524,7 @@ pub const GitignoreState = struct {
     pub fn clone(self: *const GitignoreState) GitignoreState {
         return .{
             .base = self.base,
+            .parent = self.parent,
             .local_patterns = .{},
             .local_pattern_storage = .{},
             .local_root_storage = .{},
@@ -499,22 +537,27 @@ pub const GitignoreState = struct {
     pub fn deepClone(self: *const GitignoreState) !GitignoreState {
         var new_state = GitignoreState{
             .base = self.base,
+            .parent = self.parent,
             .local_patterns = .{},
             .local_pattern_storage = .{},
             .local_root_storage = .{},
             .allocator = self.allocator,
         };
+        errdefer new_state.deinit();
 
         // Copy all local patterns
         for (self.local_patterns.items) |pattern| {
             const stored_pattern = try self.allocator.dupe(u8, pattern.pattern);
-            errdefer self.allocator.free(stored_pattern);
+            new_state.local_pattern_storage.append(self.allocator, stored_pattern) catch |err| {
+                self.allocator.free(stored_pattern);
+                return err;
+            };
 
             const stored_root = try self.allocator.dupe(u8, pattern.root);
-            errdefer self.allocator.free(stored_root);
-
-            try new_state.local_pattern_storage.append(self.allocator, stored_pattern);
-            try new_state.local_root_storage.append(self.allocator, stored_root);
+            new_state.local_root_storage.append(self.allocator, stored_root) catch |err| {
+                self.allocator.free(stored_root);
+                return err;
+            };
 
             try new_state.local_patterns.append(self.allocator, .{
                 .pattern = stored_pattern,
@@ -523,6 +566,7 @@ pub const GitignoreState = struct {
                 .directory_only = pattern.directory_only,
                 .anchored = pattern.anchored,
                 .contains_slash = pattern.contains_slash,
+                .required_last_byte = pattern.required_last_byte,
             });
         }
 
@@ -579,13 +623,21 @@ pub const GitignoreState = struct {
 
         // Store pattern string
         const stored_pattern = try self.allocator.dupe(u8, pattern_text);
-        errdefer self.allocator.free(stored_pattern);
-        try self.local_pattern_storage.append(self.allocator, stored_pattern);
+        self.local_pattern_storage.append(self.allocator, stored_pattern) catch |err| {
+            self.allocator.free(stored_pattern);
+            return err;
+        };
 
-        // Store root directory
-        const stored_root = try self.allocator.dupe(u8, root_dir);
-        errdefer self.allocator.free(stored_root);
-        try self.local_root_storage.append(self.allocator, stored_root);
+        const stored_root = if (self.local_root_storage.items.len > 0 and std.mem.eql(u8, self.local_root_storage.items[self.local_root_storage.items.len - 1], root_dir))
+            self.local_root_storage.items[self.local_root_storage.items.len - 1]
+        else blk: {
+            const root = try self.allocator.dupe(u8, root_dir);
+            self.local_root_storage.append(self.allocator, root) catch |err| {
+                self.allocator.free(root);
+                return err;
+            };
+            break :blk root;
+        };
 
         try self.local_patterns.append(self.allocator, .{
             .pattern = stored_pattern,
@@ -594,6 +646,7 @@ pub const GitignoreState = struct {
             .directory_only = directory_only,
             .anchored = anchored,
             .contains_slash = contains_slash,
+            .required_last_byte = requiredLastByte(pattern_text),
         });
     }
 
@@ -613,25 +666,14 @@ pub const GitignoreState = struct {
 
     /// Check if a path should be ignored
     pub fn isIgnored(self: *const GitignoreState, path: []const u8, is_dir: bool) bool {
-        var ignored = false;
+        const ignored = if (self.parent) |parent|
+            parent.isIgnored(path, is_dir)
+        else if (self.base) |base|
+            base.isIgnored(path, is_dir)
+        else
+            false;
 
-        // Check base patterns first
-        if (self.base) |base| {
-            for (base.patterns.items) |*pattern| {
-                if (pattern.matches(path, is_dir)) {
-                    ignored = !pattern.negated;
-                }
-            }
-        }
-
-        // Then check local patterns (can override base patterns)
-        for (self.local_patterns.items) |*pattern| {
-            if (pattern.matches(path, is_dir)) {
-                ignored = !pattern.negated;
-            }
-        }
-
-        return ignored;
+        return applyPatterns(self.local_patterns.items, path, is_dir, ignored);
     }
 
     /// Check if a file should be ignored
@@ -646,8 +688,13 @@ pub const GitignoreState = struct {
 
     /// Get total number of patterns (base + local)
     pub fn patternCount(self: *const GitignoreState) usize {
-        const base_count = if (self.base) |b| b.patterns.items.len else 0;
-        return base_count + self.local_patterns.items.len;
+        const inherited_count = if (self.parent) |parent|
+            parent.patternCount()
+        else if (self.base) |base|
+            base.patterns.items.len
+        else
+            0;
+        return inherited_count + self.local_patterns.items.len;
     }
 
     /// Get number of local patterns only

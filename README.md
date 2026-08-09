@@ -7,17 +7,19 @@ zipgrep recursively searches directories for a regex pattern while respecting `.
 ## Features
 
 - **Fast literal search** using SIMD-accelerated byte matching
-- **Literal string optimization** - extracts literals from regex patterns for fast pre-filtering
-- **Basic regex support** with `.`, `*`, `+`, `?`, `|`, and character classes
-- **Word boundary matching** with `-w` flag
+- **Multi-literal search** using packed SIMD fingerprints or Aho-Corasick
+- **Regex acceleration** using required-literal filters and bounded DFAs over a Thompson/Pike NFA
+- **Unicode-aware regexes** with scalar character classes, Unicode 16.0 Perl `\w`, and simple case folding
+- **Word boundary matching** with exact Unicode semantics via `-w`
 - **Parallel file searching** using a thread pool across multiple CPU cores
-- **Gitignore support** - automatically respects `.gitignore` patterns
+- **Inherited gitignore support** - applies repository and nested `.gitignore` rules
 - **Glob file filtering** with `-g` flag for include/exclude patterns
-- **Binary file detection** - automatically skips binary files
+- **ripgrep-compatible binary handling** for recursive, explicit-file, and streamed input
 - **Colorized output** - file paths, line numbers, and matches are highlighted
 - **Smart output formatting** - auto-detects TTY vs pipe for heading/color defaults
-- **Memory-mapped I/O** for efficient large file handling
-- **Small binary** - ~500KB compared to ripgrep's 6.5MB
+- **Bounded I/O memory** using rolling stream buffers or reclaimable 8 MiB mmap windows
+- **Early termination** for `-q` and `-l`, including cross-worker cancellation
+- **Small binary** - about 2.2 MiB versus 5.2 MiB for the Linux musl ripgrep binary used below
 
 ## Installation
 
@@ -29,7 +31,7 @@ brew install jmwoliver/tap/zipgrep
 
 ### Building from source
 
-Requires [Zig](https://ziglang.org/) 0.15.0 or later.
+Requires [Zig](https://ziglang.org/) 0.15.2.
 
 ```bash
 # Clone the repository
@@ -46,6 +48,7 @@ zig build -Doptimize=ReleaseFast
 
 ```bash
 zig build test
+zig build test-integration -Doptimize=ReleaseFast
 ```
 
 ## Usage
@@ -68,9 +71,10 @@ zg [OPTIONS] PATTERN [PATH ...]
 | `-h, --help` | Show help message |
 | `-i, --ignore-case` | Case insensitive search |
 | `-w, --word-regexp` | Match whole words only |
-| `-n, --line-number` | Show line numbers (default: on) |
+| `-n, --line-number` | Show line numbers (automatic for TTY output) |
 | `-c, --count` | Only show count of matching lines per file |
 | `-l, --files-with-matches` | Only show filenames containing matches |
+| `-q, --quiet` | Suppress output and stop after the first match |
 | `-g, --glob GLOB` | Include/exclude files or directories (supports `!` for negation) |
 | `--no-ignore` | Don't respect `.gitignore` files |
 | `--hidden` | Search hidden files and directories |
@@ -135,36 +139,36 @@ zg -j 8 "pattern" .    # Use 8 threads
 
 ## How It Works
 
-### Two-Byte SIMD Fingerprinting
+### Sampled-Pair SIMD Fingerprinting
 
-The key optimization that makes zipgrep fast is **two-byte fingerprinting**: searching for the first AND last byte of a pattern simultaneously. This reduces false positives by ~256x compared to single-byte search (based on ripgrep's "packed pair" algorithm from the memchr crate).
+One key optimization is **two-byte fingerprinting**: sampling the input, choosing two selective bytes from a pattern, and searching for both at their required offsets simultaneously. This sharply reduces false positives compared with a single-byte filter (based on ripgrep's "packed pair" approach from the memchr crate).
 
 ```zig
-// Instead of searching for just 'h' in "hello", search for 'h' AND 'o' at the correct offset
-const first_vec: Vec = @splat(first_byte);   // 'h'
-const last_vec: Vec = @splat(last_byte);     // 'o'
+// Instead of filtering on one byte, select two bytes from the pattern.
+const first_vec: Vec = @splat(first_byte);
+const second_vec: Vec = @splat(second_byte);
 
 // Load both positions in one pass
 const first_chunk: Vec = haystack[pos..][0..VECTOR_WIDTH].*;
-const last_chunk: Vec = haystack[pos + offset..][0..VECTOR_WIDTH].*;
+const second_chunk: Vec = haystack[pos + offset..][0..VECTOR_WIDTH].*;
 
 // Only positions where BOTH bytes match are candidates
 const mask = @as(MaskType, @bitCast(first_chunk == first_vec)) &
-             @as(MaskType, @bitCast(last_chunk == last_vec));
+             @as(MaskType, @bitCast(second_chunk == second_vec));
 ```
 
-For case-insensitive search, this checks **4 byte combinations** per position (upper/lower × first/last).
+For case-insensitive search, this checks **4 byte combinations** per position (upper/lower × first/second).
 
 ### Architecture-Aware Vectorization
 
-zipgrep automatically uses the widest SIMD available:
+zipgrep selects a practical SIMD width for each target:
 - **AVX2** (32 bytes) on x86_64 with AVX2 support
 - **NEON** (16 bytes) on ARM64 (Apple Silicon, etc.)
 - **Fallback** (16 bytes) on other architectures
 
-### Aho-Corasick Multi-Pattern Search
+### Packed and Aho-Corasick Multi-Pattern Search
 
-For alternation patterns like `ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT`, zipgrep uses the Aho-Corasick algorithm instead of regex:
+Pure-literal alternations such as `ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT` bypass the regex VM. Small sets use packed SIMD fingerprints (including Teddy-style filters); larger sets use Aho-Corasick:
 
 - **O(n) search**: Single pass through input regardless of number of patterns
 - **Dense transition tables**: O(1) byte lookup using 256-entry arrays per state
@@ -190,50 +194,83 @@ The scoring system selects the most selective literal:
 
 Instead of processing files line-by-line, zipgrep searches the entire buffer for the pattern first, then only processes lines that contain matches:
 
-- **1MB buffer**: Large buffer reduces syscall overhead
+- **256 KiB rolling buffer**: Amortizes syscalls while keeping recursive-worker RSS low
+- **8 MiB mmap windows**: Explicit large files avoid copies, with processed pages released via `MADV_DONTNEED`
 - **SIMD newline counting**: Uses vectorized `@popCount` for fast line number calculation
-- **Pattern overlap handling**: Keeps `pattern_len - 1` bytes at buffer boundaries
+- **Complete-line retention**: Correctly handles matches and output across read boundaries, including arbitrarily long lines
 
 ### Regex Engine
 
 zipgrep implements a Thompson NFA-based regex engine with:
 - **Bitset state tracking**: No allocations during matching (256-state bitset)
+- **Ordered Pike execution**: Preserves leftmost-first alternation and greedy quantifier semantics
+- **Bounded DFA execution**: Accelerates compatible line and count searches without unbounded state growth
 - **Literal pre-filtering**: SIMD finds candidates before NFA evaluation
 - **Greedy pattern optimization**: For `.*SUFFIX` patterns, reduces O(n²) to O(n)
 
-Supported syntax: `.`, `*`, `+`, `?`, `|`, `[abc]`, `[^abc]`, `[a-z]`, `\n`, `\t`, `\r`
+Supported syntax includes `.`, `*`, `+`, `?`, `{m}`, `{m,}`, `{m,n}`, grouping, alternation, `^`, `$`, Unicode literals and class ranges, negated classes, `\d`/`\D`, `\s`/`\S`, `\w`/`\W`, and escaped control characters.
 
 ### Parallelism
 
 zipgrep uses parallel directory traversal with work stealing:
 - **Parallel traversal**: Directory walking and file searching happen concurrently
-- **Work stealing**: Threads use a deque to balance work dynamically
+- **Safe work stealing**: Owner-LIFO/stealer-FIFO deques use synchronized claims so an owning work item can never be processed twice
 - **Configurable**: Use `-j N` to control thread count (defaults to CPU core count)
-- **Sorted output**: Results are collected and sorted for consistent ordering
+- **Batched output**: Each file is emitted under one output lock; explicit `-j 1` inputs retain command-line order
 
 ### File I/O Strategy
 
 | Scenario | Strategy |
 |----------|----------|
-| All files | Streaming with 1MB buffer |
-| stdin | Streaming with 1MB buffer |
+| Explicit regular file ≥1 MiB | mmap, processed in 8 MiB windows with page reclamation |
+| Recursive/small file | Streaming with a 256 KiB rolling buffer |
+| stdin | Streaming with a 256 KiB rolling buffer |
+| Pathological long line | Rolling buffer grows only to the longest retained line |
 
 ## Benchmarks
 
-Benchmarks comparing zipgrep (`zg`) vs ripgrep (`rg`) on the Linux kernel source (~74K files, 1.1GB) and English subtitles corpus (~130MB). Each benchmark runs 5 times with 3 warmup runs.
+Warm-cache medians below compare a `ReleaseFast` build with ripgrep 15.2.0 invoked using `--no-config`. They were measured on an 8-vCPU Intel Xeon Linux orb in August 2026. Results are workload- and hardware-dependent; they are evidence for these corpora, not a claim that any implementation wins universally.
 
-| Benchmark | Pattern | zg (median) | rg (median) | Speedup |
-|-----------|---------|-------------|-------------|---------|
-| linux_literal | `PM_RESUME` | 1241ms | 2069ms | **1.67x** |
-| linux_literal_casei | `PM_RESUME` (case-insensitive) | 1260ms | 1876ms | **1.49x** |
-| linux_word | `PM_RESUME` (word boundary) | 1299ms | 2099ms | **1.62x** |
-| linux_re_suffix | `[A-Z]+_RESUME` | 1203ms | 1882ms | **1.56x** |
-| linux_alternates | `ERR_SYS\|PME_TURN_OFF\|...` | 1572ms | 2029ms | **1.29x** |
-| linux_alternates_casei | (case-insensitive) | 1507ms | 1867ms | **1.24x** |
-| subtitles_literal | `Sherlock Holmes` | 1415ms | 1509ms | **1.07x** |
-| subtitles_literal_casei | (case-insensitive) | 1826ms | 2885ms | **1.58x** |
+### 512 MiB English subtitle file
 
-**Summary**: zipgrep is 1.07x-1.67x faster than ripgrep across all tested scenarios.
+| Mode and pattern | zg | rg | zg / rg |
+|------------------|---:|---:|--------:|
+| count `Sherlock` | 105.0 ms | 113.0 ms | **0.93** |
+| count absent literal | 93.3 ms | 106.8 ms | **0.87** |
+| count `.` | 607.1 ms | 1294.2 ms | **0.47** |
+| count `-w .` | 646.0 ms | 1541.9 ms | **0.42** |
+| count `[^abc]+` | 640.9 ms | 1956.7 ms | **0.33** |
+| count `-i 'Sherlock\|John'` | 117.0 ms | 205.5 ms | **0.57** |
+| sparse matching output | 116.5 ms | 125.1 ms | **0.93** |
+| dense matching output | 1096.7 ms | 1983.4 ms | **0.55** |
+| quiet, early match | 0.5 ms | 1.8 ms | **0.26** |
+| quiet, absent match | 103.9 ms | 129.6 ms | **0.80** |
+| stdin count `Sherlock` | 111.6 ms | 120.8 ms | **0.92** |
+
+On a 128 MiB slice, dense forced-color output took 658 ms versus 4403 ms; sparse forced-color output took 28.7 ms versus 32.4 ms. Output bytes were compared exactly, including all non-overlapping highlighted matches.
+
+### Linux source tree (1.7 GiB, 79K files)
+
+| Mode | zg | rg | zg / rg |
+|------|---:|---:|--------:|
+| absent, `-q -j1` | 774.7 ms | 863.8 ms | **0.90** |
+| absent, `-q -j8` | 107.9 ms | 177.8 ms | **0.61** |
+| early match, `-q -j8` | 2.8 ms | 7.8 ms | **0.36** |
+| list files, `-l -j8` | 113.5 ms | 182.0 ms | **0.62** |
+| count files, `-c -j8` | 125.6 ms | 194.7 ms | **0.65** |
+
+Sorted recursive normal, list, and count output was byte-for-byte identical for the benchmark pattern.
+
+### Peak resident memory
+
+GNU `time` maximum RSS (median of three runs):
+
+| Workload | zg | rg |
+|----------|---:|---:|
+| 512 MiB explicit-file count | 4.5 MiB | 513 MiB |
+| 512 MiB stdin count | 0.6 MiB | 4.4 MiB |
+| 2 MiB single long line | 0.6 MiB | 5.5 MiB |
+| 1.7 GiB recursive absent search, `-j8` | 3.2 MiB | 13.4 MiB |
 
 ## Project Structure
 
