@@ -51,7 +51,7 @@ const State = struct {
         return .{
             .goto = [_]u32{NO_TRANSITION} ** ALPHABET_SIZE,
             .failure = 0,
-            .outputs = .{},
+            .outputs = .empty,
             .depth = 0,
         };
     }
@@ -87,7 +87,7 @@ pub const AhoCorasick = struct {
     pub fn compile(allocator: std.mem.Allocator, patterns: []const []const u8) !AhoCorasick {
         var ac = AhoCorasick{
             .allocator = allocator,
-            .states = .{},
+            .states = .empty,
             .patterns = patterns,
             .pattern_lengths = try allocator.alloc(u32, patterns.len),
             .max_pattern_len = 0,
@@ -138,7 +138,7 @@ pub const AhoCorasick = struct {
     }
 
     fn buildFailureLinks(self: *AhoCorasick) !void {
-        var queue = std.ArrayListUnmanaged(u32){};
+        var queue: std.ArrayListUnmanaged(u32) = .empty;
         defer queue.deinit(self.allocator);
 
         // Initialize: all depth-1 states have failure link to root

@@ -7,6 +7,7 @@ const gitignore = @import("gitignore.zig");
 const deque = @import("deque.zig");
 const aho_corasick = @import("aho_corasick.zig");
 const simd = @import("simd.zig");
+const io = std.Io.Threaded.global_single_threaded.io();
 
 /// One immutable level in a directory's inherited ignore context. Nodes are
 /// shared by child jobs and may cross worker threads through work stealing.
@@ -139,7 +140,7 @@ pub const ParallelWalker = struct {
     /// Worker-side I/O/allocation errors are recorded and reported after join.
     had_error: std.atomic.Value(bool),
     broken_pipe: std.atomic.Value(bool),
-    error_mutex: std.Thread.Mutex,
+    error_mutex: std.Io.Mutex,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -189,7 +190,7 @@ pub const ParallelWalker = struct {
             .initialized_workers = std.atomic.Value(usize).init(0),
             .had_error = std.atomic.Value(bool).init(false),
             .broken_pipe = std.atomic.Value(bool).init(false),
-            .error_mutex = .{},
+            .error_mutex = .init,
         };
 
         return walker;
@@ -235,7 +236,7 @@ pub const ParallelWalker = struct {
                 continue;
             }
 
-            const stat = std.fs.cwd().statFile(path) catch |err| {
+            const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| {
                 self.recordError(path, err);
                 continue;
             };
@@ -429,7 +430,7 @@ pub const ParallelWalker = struct {
                     6...10 => 500_000, // 500µs
                     else => 2_000_000, // 2ms - save CPU when truly idle
                 };
-                std.Thread.sleep(sleep_ns);
+                io.sleep(.fromNanoseconds(sleep_ns), .awake) catch {};
 
                 // Check if done
                 if (self.done.load(.acquire)) {
@@ -487,11 +488,11 @@ pub const ParallelWalker = struct {
         }
 
         // Open directory
-        var dir = std.fs.cwd().openDir(work.path, .{ .iterate = true }) catch |err| {
+        var dir = std.Io.Dir.cwd().openDir(io, work.path, .{ .iterate = true }) catch |err| {
             self.recordError(work.path, err);
             return;
         };
-        defer dir.close();
+        defer dir.close(io);
 
         // The root's .gitignore and its ancestors are already in the immutable
         // base matcher. Every child loads only its own local file and shares its
@@ -530,7 +531,7 @@ pub const ParallelWalker = struct {
         var iter = dir.iterate();
         while (true) {
             if (self.done.load(.acquire)) break;
-            const entry = (iter.next() catch |err| {
+            const entry = (iter.next(io) catch |err| {
                 self.recordError(work.path, err);
                 break;
             }) orelse break;
@@ -607,15 +608,15 @@ pub const ParallelWalker = struct {
             return;
         }
         self.had_error.store(true, .release);
-        self.error_mutex.lock();
-        defer self.error_mutex.unlock();
+        self.error_mutex.lockUncancelable(io);
+        defer self.error_mutex.unlock(io);
         std.debug.print("zg: {s}: {s}\n", .{ path, @errorName(err) });
     }
 
     /// Search stdin for matches
     fn searchStdin(self: *ParallelWalker) !void {
         const buffer_size: usize = if (self.config.files_with_matches) 64 * 1024 else 256 * 1024;
-        var stream = try reader.StreamingLineReader.initFileWithBuffer(std.heap.smp_allocator, std.fs.File.stdin(), false, buffer_size);
+        var stream = try reader.StreamingLineReader.initFileWithBuffer(std.heap.smp_allocator, std.Io.File.stdin(), false, buffer_size);
         defer stream.deinit();
         try self.searchStream(&stream, "<stdin>");
     }
@@ -881,7 +882,7 @@ test "ParallelWalker: init and deinit" {
     var pattern_matcher = try matcher_mod.Matcher.init(allocator, "test", false, false);
     defer pattern_matcher.deinit();
 
-    const stdout = std.fs.File.stdout();
+    const stdout = std.Io.File.stdout();
     var out = output.Output.init(stdout, config);
 
     var walker = try ParallelWalker.init(allocator, config, &pattern_matcher, null, &out);
@@ -906,7 +907,7 @@ test "ParallelWalker: with gitignore matcher" {
     defer ignore_matcher.deinit();
     try ignore_matcher.addPattern("*.log", ".");
 
-    const stdout = std.fs.File.stdout();
+    const stdout = std.Io.File.stdout();
     var out = output.Output.init(stdout, config);
 
     var walker = try ParallelWalker.init(allocator, config, &pattern_matcher, &ignore_matcher, &out);

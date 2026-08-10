@@ -1,4 +1,5 @@
 const std = @import("std");
+const io = std.testing.io;
 
 const Result = struct {
     stdout: []u8,
@@ -15,7 +16,7 @@ const Result = struct {
 fn runZipgrep(allocator: std.mem.Allocator, args: []const []const u8) !Result {
     const exe_path = "zig-out/bin/zg";
 
-    var argv = std.ArrayListUnmanaged([]const u8){};
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv.deinit(allocator);
 
     try argv.append(allocator, exe_path);
@@ -23,29 +24,19 @@ fn runZipgrep(allocator: std.mem.Allocator, args: []const []const u8) !Result {
         try argv.append(allocator, arg);
     }
 
-    var child = std.process.Child.init(argv.items, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
-
-    // Use collectOutput with ArrayList outputs (Zig 0.15 style)
-    var stdout_list: std.ArrayList(u8) = .empty;
-    defer stdout_list.deinit(allocator);
-    var stderr_list: std.ArrayList(u8) = .empty;
-    defer stderr_list.deinit(allocator);
-
-    try child.collectOutput(allocator, &stdout_list, &stderr_list, 1024 * 1024);
-
-    const term = try child.wait();
-    const exit_code: u8 = switch (term) {
-        .Exited => |code| code,
+    const run_result = try std.process.run(allocator, io, .{
+        .argv = argv.items,
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    });
+    const exit_code: u8 = switch (run_result.term) {
+        .exited => |code| code,
         else => 255,
     };
 
     return .{
-        .stdout = try stdout_list.toOwnedSlice(allocator),
-        .stderr = try stderr_list.toOwnedSlice(allocator),
+        .stdout = run_result.stdout,
+        .stderr = run_result.stderr,
         .exit_code = exit_code,
     };
 }
@@ -466,11 +457,11 @@ test "integration: word boundary with greedy .* prefix finds valid match" {
 
     // Write test file
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
-        try file.writeAll(test_content);
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, test_content);
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     // Run zg with -w flag
     const result = try runZipgrep(allocator, &.{ "-w", ".*_cache", temp_path });
@@ -494,11 +485,11 @@ test "integration: word boundary with greedy .* prefix no valid match" {
 
     // Write test file
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
-        try file.writeAll(test_content);
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, test_content);
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     // Run zg with -w flag
     const result = try runZipgrep(allocator, &.{ "-w", ".*_cache", temp_path });
@@ -521,13 +512,13 @@ test "integration: word boundary with greedy .* long line" {
 
     // Add many non-boundary occurrences
     for (0..50) |i| {
-        try content.writer(allocator).print("item{d}_cache_ext ", .{i});
+        try content.print(allocator, "item{d}_cache_ext ", .{i});
     }
     // Add one valid word boundary occurrence
     try content.appendSlice(allocator, "final_cache ");
     // Add more non-boundary occurrences after
     for (50..100) |i| {
-        try content.writer(allocator).print("item{d}_cache_more ", .{i});
+        try content.print(allocator, "item{d}_cache_more ", .{i});
     }
     try content.append(allocator, '\n');
 
@@ -535,11 +526,11 @@ test "integration: word boundary with greedy .* long line" {
 
     // Write test file
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
-        try file.writeAll(content.items);
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, content.items);
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     // Run zg with -w flag
     const result = try runZipgrep(allocator, &.{ "-w", ".*_cache", temp_path });
@@ -563,11 +554,11 @@ test "integration: word boundary .* match at end of line" {
 
     // Write test file
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
-        try file.writeAll(test_content);
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, test_content);
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     // Run zg with -w flag
     const result = try runZipgrep(allocator, &.{ "-w", ".*_suffix", temp_path });
@@ -587,7 +578,7 @@ test "integration: word boundary .* match at end of line" {
 fn runZipgrepWithStdin(allocator: std.mem.Allocator, args: []const []const u8, stdin_input: []const u8) !Result {
     const exe_path = "zig-out/bin/zg";
 
-    var argv = std.ArrayListUnmanaged([]const u8){};
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv.deinit(allocator);
 
     try argv.append(allocator, exe_path);
@@ -595,37 +586,50 @@ fn runZipgrepWithStdin(allocator: std.mem.Allocator, args: []const []const u8, s
         try argv.append(allocator, arg);
     }
 
-    var child = std.process.Child.init(argv.items, allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
+    var child = try std.process.spawn(io, .{
+        .argv = argv.items,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    defer child.kill(io);
 
     // Write stdin input and close
     if (child.stdin) |stdin| {
-        try stdin.writeAll(stdin_input);
-        stdin.close();
+        try stdin.writeStreamingAll(io, stdin_input);
+        stdin.close(io);
     }
     child.stdin = null;
 
-    // Use collectOutput with ArrayList outputs (Zig 0.15 style)
-    var stdout_list: std.ArrayList(u8) = .empty;
-    defer stdout_list.deinit(allocator);
-    var stderr_list: std.ArrayList(u8) = .empty;
-    defer stderr_list.deinit(allocator);
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
 
-    try child.collectOutput(allocator, &stdout_list, &stderr_list, 1024 * 1024);
+    const stdout_reader = multi_reader.reader(0);
+    const stderr_reader = multi_reader.reader(1);
+    while (multi_reader.fill(0, .none)) |_| {
+        if (stdout_reader.buffered().len > 1024 * 1024 or stderr_reader.buffered().len > 1024 * 1024)
+            return error.StreamTooLong;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |e| return e,
+    }
+    try multi_reader.checkAnyError();
 
-    const term = try child.wait();
+    const term = try child.wait(io);
     const exit_code: u8 = switch (term) {
-        .Exited => |code| code,
+        .exited => |code| code,
         else => 255,
     };
 
+    const stdout = try multi_reader.toOwnedSlice(0);
+    errdefer allocator.free(stdout);
+    const stderr = try multi_reader.toOwnedSlice(1);
+
     return .{
-        .stdout = try stdout_list.toOwnedSlice(allocator),
-        .stderr = try stderr_list.toOwnedSlice(allocator),
+        .stdout = stdout,
+        .stderr = stderr,
         .exit_code = exit_code,
     };
 }
@@ -860,20 +864,20 @@ test "integration: large file search" {
 
     // Create ~500KB file with known pattern
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
         // Write 10000 lines of filler
         const line = "line XXXXX: some text content here\n";
         for (0..10000) |_| {
-            try file.writeAll(line);
+            try file.writeStreamingAll(io, line);
         }
-        try file.writeAll("UNIQUE_PATTERN_HERE on this line\n");
+        try file.writeStreamingAll(io, "UNIQUE_PATTERN_HERE on this line\n");
         // Write 10000 more lines
         for (0..10000) |_| {
-            try file.writeAll(line);
+            try file.writeStreamingAll(io, line);
         }
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     const result = try runZipgrep(allocator, &.{ "UNIQUE_PATTERN_HERE", temp_path });
     defer allocator.free(result.stdout);
@@ -889,15 +893,15 @@ test "integration: case insensitive large file" {
     const temp_path = "/tmp/zipgrep_ci_test.txt";
 
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
         // Write lines alternating between PATTERN and pattern
         for (0..2500) |_| {
-            try file.writeAll("line XXXXX: PATTERN here\n");
-            try file.writeAll("line XXXXX: pattern there\n");
+            try file.writeStreamingAll(io, "line XXXXX: PATTERN here\n");
+            try file.writeStreamingAll(io, "line XXXXX: pattern there\n");
         }
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     // Count matches
     const result = try runZipgrep(allocator, &.{ "-i", "-c", "pattern", temp_path });
@@ -914,19 +918,19 @@ test "integration: line numbers correct with many lines" {
     const temp_path = "/tmp/zipgrep_linenum_test.txt";
 
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
         // Write 499 filler lines, then target, then 500 more filler lines
         const filler_line = "line content filler text here\n";
         for (0..499) |_| {
-            try file.writeAll(filler_line);
+            try file.writeStreamingAll(io, filler_line);
         }
-        try file.writeAll("TARGET_LINE_HERE\n");
+        try file.writeStreamingAll(io, "TARGET_LINE_HERE\n");
         for (0..500) |_| {
-            try file.writeAll(filler_line);
+            try file.writeStreamingAll(io, filler_line);
         }
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     const result = try runZipgrep(allocator, &.{ "-n", "TARGET_LINE_HERE", temp_path });
     defer allocator.free(result.stdout);
@@ -944,16 +948,16 @@ test "integration: pattern at buffer boundary" {
     const temp_path = "/tmp/zipgrep_boundary_test.txt";
 
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
         // Write content with patterns at various offsets that cross SIMD boundaries
         // SIMD width is 16 bytes on ARM, so write patterns near 14, 15, 16, 17 byte offsets
-        try file.writeAll("prefix14xxxxBOUNDARY_PATTERN_TEST_ONE\n"); // pattern starts at offset 14
-        try file.writeAll("prefix15xxxxxBOUNDARY_PATTERN_TEST_TWO\n"); // pattern starts at offset 15
-        try file.writeAll("prefix16xxxxxxBOUNDARY_PATTERN_TEST_THREE\n"); // pattern starts at offset 16
-        try file.writeAll("prefix31xxxxxxxxxxxxxxxxxxxxxxBOUNDARY_PATTERN_TEST_FOUR\n"); // pattern starts at offset 31
+        try file.writeStreamingAll(io, "prefix14xxxxBOUNDARY_PATTERN_TEST_ONE\n"); // pattern starts at offset 14
+        try file.writeStreamingAll(io, "prefix15xxxxxBOUNDARY_PATTERN_TEST_TWO\n"); // pattern starts at offset 15
+        try file.writeStreamingAll(io, "prefix16xxxxxxBOUNDARY_PATTERN_TEST_THREE\n"); // pattern starts at offset 16
+        try file.writeStreamingAll(io, "prefix31xxxxxxxxxxxxxxxxxxxxxxBOUNDARY_PATTERN_TEST_FOUR\n"); // pattern starts at offset 31
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     const result = try runZipgrep(allocator, &.{ "-c", "BOUNDARY_PATTERN_TEST", temp_path });
     defer allocator.free(result.stdout);
@@ -970,11 +974,11 @@ test "integration: two byte pattern search" {
     const temp_path = "/tmp/zipgrep_twobyte_test.txt";
 
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
-        try file.writeAll("xx ab xx ab xx cd xx\nab at start\nend with ab\n");
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "xx ab xx ab xx cd xx\nab at start\nend with ab\n");
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     const result = try runZipgrep(allocator, &.{ "-c", "ab", temp_path });
     defer allocator.free(result.stdout);
@@ -992,19 +996,19 @@ test "integration: long pattern search" {
     const long_pattern = "this_is_a_very_long_pattern_for_testing_simd_search";
 
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
         // Write filler lines
         const filler_line = "line content: some filler content here\n";
         for (0..100) |_| {
-            try file.writeAll(filler_line);
+            try file.writeStreamingAll(io, filler_line);
         }
-        try file.writeAll("found: " ++ long_pattern ++ "\n");
+        try file.writeStreamingAll(io, "found: " ++ long_pattern ++ "\n");
         for (0..100) |_| {
-            try file.writeAll(filler_line);
+            try file.writeStreamingAll(io, filler_line);
         }
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     const result = try runZipgrep(allocator, &.{ long_pattern, temp_path });
     defer allocator.free(result.stdout);
@@ -1020,14 +1024,14 @@ test "integration: many matches same line" {
     const temp_path = "/tmp/zipgrep_manymatches_test.txt";
 
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
         // Line with multiple "ab" occurrences
-        try file.writeAll("ab ab ab ab ab ab ab ab ab ab\n");
-        try file.writeAll("no matches here\n");
-        try file.writeAll("ab ab ab\n");
+        try file.writeStreamingAll(io, "ab ab ab ab ab ab ab ab ab ab\n");
+        try file.writeStreamingAll(io, "no matches here\n");
+        try file.writeStreamingAll(io, "ab ab ab\n");
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     // Just check that it finds matches without crashing
     const result = try runZipgrep(allocator, &.{ "ab", temp_path });
@@ -1044,16 +1048,16 @@ test "integration: empty lines handling" {
     const temp_path = "/tmp/zipgrep_emptylines_test.txt";
 
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
         // Write 100 empty lines, then content, then 100 more empty lines
         // Use batched writes for efficiency
         const empty_lines = "\n" ** 100;
-        try file.writeAll(empty_lines);
-        try file.writeAll("TARGET_ON_LINE_101\n");
-        try file.writeAll(empty_lines);
+        try file.writeStreamingAll(io, empty_lines);
+        try file.writeStreamingAll(io, "TARGET_ON_LINE_101\n");
+        try file.writeStreamingAll(io, empty_lines);
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     const result = try runZipgrep(allocator, &.{ "-n", "TARGET_ON_LINE_101", temp_path });
     defer allocator.free(result.stdout);
@@ -1073,16 +1077,16 @@ test "integration: alternation basic" {
     const temp_path = "/tmp/zipgrep_alternation_test.txt";
 
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
-        try file.writeAll("line with ERR_SYS error\n");
-        try file.writeAll("line with no match\n");
-        try file.writeAll("line with PME_TURN_OFF event\n");
-        try file.writeAll("another line without match\n");
-        try file.writeAll("line with LINK_REQ_RST status\n");
-        try file.writeAll("final line with CFG_BME_EVT config\n");
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "line with ERR_SYS error\n");
+        try file.writeStreamingAll(io, "line with no match\n");
+        try file.writeStreamingAll(io, "line with PME_TURN_OFF event\n");
+        try file.writeStreamingAll(io, "another line without match\n");
+        try file.writeStreamingAll(io, "line with LINK_REQ_RST status\n");
+        try file.writeStreamingAll(io, "final line with CFG_BME_EVT config\n");
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     const result = try runZipgrep(allocator, &.{ "ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT", temp_path });
     defer allocator.free(result.stdout);
@@ -1102,16 +1106,16 @@ test "integration: alternation count mode" {
     const temp_path = "/tmp/zipgrep_alternation_count_test.txt";
 
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
-        try file.writeAll("ERROR here\n");
-        try file.writeAll("no match\n");
-        try file.writeAll("WARNING here\n");
-        try file.writeAll("no match\n");
-        try file.writeAll("INFO here\n");
-        try file.writeAll("no match\n");
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "ERROR here\n");
+        try file.writeStreamingAll(io, "no match\n");
+        try file.writeStreamingAll(io, "WARNING here\n");
+        try file.writeStreamingAll(io, "no match\n");
+        try file.writeStreamingAll(io, "INFO here\n");
+        try file.writeStreamingAll(io, "no match\n");
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     const result = try runZipgrep(allocator, &.{ "-c", "ERROR|WARNING|INFO", temp_path });
     defer allocator.free(result.stdout);
@@ -1127,15 +1131,15 @@ test "integration: alternation case insensitive" {
     const temp_path = "/tmp/zipgrep_alternation_casei_test.txt";
 
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
-        try file.writeAll("line with FOO uppercase\n");
-        try file.writeAll("line with foo lowercase\n");
-        try file.writeAll("line with Bar mixedcase\n");
-        try file.writeAll("line with BAZ uppercase\n");
-        try file.writeAll("no match here\n");
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "line with FOO uppercase\n");
+        try file.writeStreamingAll(io, "line with foo lowercase\n");
+        try file.writeStreamingAll(io, "line with Bar mixedcase\n");
+        try file.writeStreamingAll(io, "line with BAZ uppercase\n");
+        try file.writeStreamingAll(io, "no match here\n");
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     const result = try runZipgrep(allocator, &.{ "-i", "foo|bar|baz", temp_path });
     defer allocator.free(result.stdout);
@@ -1157,15 +1161,15 @@ test "integration: alternation word boundary" {
     const temp_path = "/tmp/zipgrep_alternation_word_test.txt";
 
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
-        try file.writeAll("line with ERR standalone\n");
-        try file.writeAll("line with ERROR embedded\n"); // ERR is NOT word-bounded here
-        try file.writeAll("line with WARN standalone\n");
-        try file.writeAll("line with WARNING embedded\n"); // WARN is NOT word-bounded here
-        try file.writeAll("no match here\n");
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "line with ERR standalone\n");
+        try file.writeStreamingAll(io, "line with ERROR embedded\n"); // ERR is NOT word-bounded here
+        try file.writeStreamingAll(io, "line with WARN standalone\n");
+        try file.writeStreamingAll(io, "line with WARNING embedded\n"); // WARN is NOT word-bounded here
+        try file.writeStreamingAll(io, "no match here\n");
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     const result = try runZipgrep(allocator, &.{ "-w", "ERR|WARN", temp_path });
     defer allocator.free(result.stdout);
@@ -1186,16 +1190,16 @@ test "integration: alternation line numbers" {
     const temp_path = "/tmp/zipgrep_alternation_lineno_test.txt";
 
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
-        try file.writeAll("no match\n"); // line 1
-        try file.writeAll("AAA here\n"); // line 2
-        try file.writeAll("no match\n"); // line 3
-        try file.writeAll("BBB here\n"); // line 4
-        try file.writeAll("no match\n"); // line 5
-        try file.writeAll("CCC here\n"); // line 6
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "no match\n"); // line 1
+        try file.writeStreamingAll(io, "AAA here\n"); // line 2
+        try file.writeStreamingAll(io, "no match\n"); // line 3
+        try file.writeStreamingAll(io, "BBB here\n"); // line 4
+        try file.writeStreamingAll(io, "no match\n"); // line 5
+        try file.writeStreamingAll(io, "CCC here\n"); // line 6
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     const result = try runZipgrep(allocator, &.{ "-n", "AAA|BBB|CCC", temp_path });
     defer allocator.free(result.stdout);
@@ -1213,13 +1217,13 @@ test "integration: alternation no match" {
     const temp_path = "/tmp/zipgrep_alternation_nomatch_test.txt";
 
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
-        try file.writeAll("line one\n");
-        try file.writeAll("line two\n");
-        try file.writeAll("line three\n");
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "line one\n");
+        try file.writeStreamingAll(io, "line two\n");
+        try file.writeStreamingAll(io, "line three\n");
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     const result = try runZipgrep(allocator, &.{ "XYZ|ABC|DEF", temp_path });
     defer allocator.free(result.stdout);
@@ -1235,19 +1239,19 @@ test "integration: alternation recursive" {
     const temp_dir = "/tmp/zipgrep_alternation_recursive";
 
     // Create directory structure
-    std.fs.cwd().deleteTree(temp_dir) catch {};
-    try std.fs.cwd().makePath(temp_dir ++ "/subdir");
+    std.Io.Dir.cwd().deleteTree(io, temp_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, temp_dir ++ "/subdir");
 
     {
-        const file1 = try std.fs.cwd().createFile(temp_dir ++ "/file1.txt", .{});
-        defer file1.close();
-        try file1.writeAll("AAA in file1\n");
+        const file1 = try std.Io.Dir.cwd().createFile(io, temp_dir ++ "/file1.txt", .{});
+        defer file1.close(io);
+        try file1.writeStreamingAll(io, "AAA in file1\n");
 
-        const file2 = try std.fs.cwd().createFile(temp_dir ++ "/subdir/file2.txt", .{});
-        defer file2.close();
-        try file2.writeAll("BBB in file2\n");
+        const file2 = try std.Io.Dir.cwd().createFile(io, temp_dir ++ "/subdir/file2.txt", .{});
+        defer file2.close(io);
+        try file2.writeStreamingAll(io, "BBB in file2\n");
     }
-    defer std.fs.cwd().deleteTree(temp_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, temp_dir) catch {};
 
     const result = try runZipgrep(allocator, &.{ "AAA|BBB", temp_dir });
     defer allocator.free(result.stdout);
@@ -1265,14 +1269,14 @@ test "integration: alternation multiple matches per line" {
     const temp_path = "/tmp/zipgrep_alternation_multiline_test.txt";
 
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
         // Line with multiple matching alternatives
-        try file.writeAll("ERR_SYS and PME_TURN_OFF on same line\n");
-        try file.writeAll("no match\n");
-        try file.writeAll("LINK_REQ_RST only\n");
+        try file.writeStreamingAll(io, "ERR_SYS and PME_TURN_OFF on same line\n");
+        try file.writeStreamingAll(io, "no match\n");
+        try file.writeStreamingAll(io, "LINK_REQ_RST only\n");
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     const result = try runZipgrep(allocator, &.{ "-c", "ERR_SYS|PME_TURN_OFF|LINK_REQ_RST", temp_path });
     defer allocator.free(result.stdout);
@@ -1288,15 +1292,15 @@ test "integration: alternation combined flags" {
     const temp_path = "/tmp/zipgrep_alternation_combined_test.txt";
 
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
-        try file.writeAll("line one\n"); // line 1
-        try file.writeAll("FOO standalone\n"); // line 2 - matches
-        try file.writeAll("FOOBAR embedded\n"); // line 3 - no match (word boundary)
-        try file.writeAll("bar standalone\n"); // line 4 - matches (case insensitive)
-        try file.writeAll("barbaz embedded\n"); // line 5 - no match
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "line one\n"); // line 1
+        try file.writeStreamingAll(io, "FOO standalone\n"); // line 2 - matches
+        try file.writeStreamingAll(io, "FOOBAR embedded\n"); // line 3 - no match (word boundary)
+        try file.writeStreamingAll(io, "bar standalone\n"); // line 4 - matches (case insensitive)
+        try file.writeStreamingAll(io, "barbaz embedded\n"); // line 5 - no match
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     const result = try runZipgrep(allocator, &.{ "-i", "-w", "-n", "foo|bar", temp_path });
     defer allocator.free(result.stdout);
@@ -1316,24 +1320,24 @@ test "integration: alternation large file" {
     const temp_path = "/tmp/zipgrep_alternation_large_test.txt";
 
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
 
         // Write many lines, with matches scattered throughout
         var i: usize = 0;
         while (i < 10000) : (i += 1) {
             if (i == 1000) {
-                try file.writeAll("ERROR_CODE_ALPHA found\n");
+                try file.writeStreamingAll(io, "ERROR_CODE_ALPHA found\n");
             } else if (i == 5000) {
-                try file.writeAll("ERROR_CODE_BETA found\n");
+                try file.writeStreamingAll(io, "ERROR_CODE_BETA found\n");
             } else if (i == 9000) {
-                try file.writeAll("ERROR_CODE_GAMMA found\n");
+                try file.writeStreamingAll(io, "ERROR_CODE_GAMMA found\n");
             } else {
-                try file.writeAll("normal line content here\n");
+                try file.writeStreamingAll(io, "normal line content here\n");
             }
         }
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     const result = try runZipgrep(allocator, &.{ "-c", "ERROR_CODE_ALPHA|ERROR_CODE_BETA|ERROR_CODE_GAMMA", temp_path });
     defer allocator.free(result.stdout);
@@ -1350,14 +1354,14 @@ test "integration: alternation single character patterns" {
     const temp_path = "/tmp/zipgrep_alternation_singlechar_test.txt";
 
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
-        try file.writeAll("line with a\n");
-        try file.writeAll("line with b\n");
-        try file.writeAll("line with c\n");
-        try file.writeAll("line with d\n");
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "line with a\n");
+        try file.writeStreamingAll(io, "line with b\n");
+        try file.writeStreamingAll(io, "line with c\n");
+        try file.writeStreamingAll(io, "line with d\n");
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     const result = try runZipgrep(allocator, &.{ "-c", "a|b|c", temp_path });
     defer allocator.free(result.stdout);
@@ -1373,15 +1377,15 @@ test "integration: alternation special chars in patterns" {
     const temp_path = "/tmp/zipgrep_alternation_special_test.txt";
 
     {
-        const file = try std.fs.cwd().createFile(temp_path, .{});
-        defer file.close();
-        try file.writeAll("CONFIG_DEBUG_123 enabled\n");
-        try file.writeAll("some other line\n");
-        try file.writeAll("FLAG_VERBOSE_456 set\n");
-        try file.writeAll("another line\n");
-        try file.writeAll("OPT_TRACE_789 active\n");
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "CONFIG_DEBUG_123 enabled\n");
+        try file.writeStreamingAll(io, "some other line\n");
+        try file.writeStreamingAll(io, "FLAG_VERBOSE_456 set\n");
+        try file.writeStreamingAll(io, "another line\n");
+        try file.writeStreamingAll(io, "OPT_TRACE_789 active\n");
     }
-    defer std.fs.cwd().deleteFile(temp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
     const result = try runZipgrep(allocator, &.{ "CONFIG_DEBUG_123|FLAG_VERBOSE_456|OPT_TRACE_789", temp_path });
     defer allocator.free(result.stdout);
@@ -1399,16 +1403,16 @@ test "integration: one worker preserves explicit source order" {
     const first_path = temp_dir ++ "/first.txt";
     const second_path = temp_dir ++ "/second.txt";
 
-    std.fs.cwd().deleteTree(temp_dir) catch {};
-    try std.fs.cwd().makePath(temp_dir);
-    defer std.fs.cwd().deleteTree(temp_dir) catch {};
+    std.Io.Dir.cwd().deleteTree(io, temp_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, temp_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, temp_dir) catch {};
     {
-        const first = try std.fs.cwd().createFile(first_path, .{});
-        defer first.close();
-        try first.writeAll("ORDER_MATCH first\n");
-        const second = try std.fs.cwd().createFile(second_path, .{});
-        defer second.close();
-        try second.writeAll("ORDER_MATCH second\n");
+        const first = try std.Io.Dir.cwd().createFile(io, first_path, .{});
+        defer first.close(io);
+        try first.writeStreamingAll(io, "ORDER_MATCH first\n");
+        const second = try std.Io.Dir.cwd().createFile(io, second_path, .{});
+        defer second.close(io);
+        try second.writeStreamingAll(io, "ORDER_MATCH second\n");
     }
 
     var result = try runZipgrep(allocator, &.{ "-j", "1", "ORDER_MATCH", first_path, second_path });

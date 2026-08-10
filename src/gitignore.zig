@@ -1,4 +1,5 @@
 const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
 
 /// A pattern from a gitignore file with its scope
 const Pattern = struct {
@@ -348,9 +349,9 @@ pub const GitignoreMatcher = struct {
     pub fn init(allocator: std.mem.Allocator) GitignoreMatcher {
         return .{
             .allocator = allocator,
-            .patterns = .{},
-            .pattern_storage = .{},
-            .root_storage = .{},
+            .patterns = .empty,
+            .pattern_storage = .empty,
+            .root_storage = .empty,
         };
     }
 
@@ -371,10 +372,12 @@ pub const GitignoreMatcher = struct {
     /// Load patterns from a gitignore file
     /// root_dir is the directory containing the .gitignore file
     pub fn loadFile(self: *GitignoreMatcher, path: []const u8, root_dir: []const u8) !void {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
 
-        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        var read_buffer: [4096]u8 = undefined;
+        var file_reader = file.reader(io, &read_buffer);
+        const content = try file_reader.interface.allocRemaining(self.allocator, .limited(1024 * 1024));
         defer self.allocator.free(content);
 
         var lines = std.mem.splitScalar(u8, content, '\n');
@@ -511,9 +514,9 @@ pub const GitignoreState = struct {
         return .{
             .base = base,
             .parent = null,
-            .local_patterns = .{},
-            .local_pattern_storage = .{},
-            .local_root_storage = .{},
+            .local_patterns = .empty,
+            .local_pattern_storage = .empty,
+            .local_root_storage = .empty,
             .allocator = allocator,
         };
     }
@@ -525,9 +528,9 @@ pub const GitignoreState = struct {
         return .{
             .base = self.base,
             .parent = self.parent,
-            .local_patterns = .{},
-            .local_pattern_storage = .{},
-            .local_root_storage = .{},
+            .local_patterns = .empty,
+            .local_pattern_storage = .empty,
+            .local_root_storage = .empty,
             .allocator = self.allocator,
         };
     }
@@ -538,9 +541,9 @@ pub const GitignoreState = struct {
         var new_state = GitignoreState{
             .base = self.base,
             .parent = self.parent,
-            .local_patterns = .{},
-            .local_pattern_storage = .{},
-            .local_root_storage = .{},
+            .local_patterns = .empty,
+            .local_pattern_storage = .empty,
+            .local_root_storage = .empty,
             .allocator = self.allocator,
         };
         errdefer new_state.deinit();
@@ -652,10 +655,12 @@ pub const GitignoreState = struct {
 
     /// Load patterns from a gitignore file
     pub fn loadFile(self: *GitignoreState, path: []const u8, root_dir: []const u8) !void {
-        const file = std.fs.cwd().openFile(path, .{}) catch return;
-        defer file.close();
+        const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return;
+        defer file.close(io);
 
-        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        var read_buffer: [4096]u8 = undefined;
+        var file_reader = file.reader(io, &read_buffer);
+        const content = try file_reader.interface.allocRemaining(self.allocator, .limited(1024 * 1024));
         defer self.allocator.free(content);
 
         var lines = std.mem.splitScalar(u8, content, '\n');
@@ -708,7 +713,7 @@ pub const GitignoreState = struct {
 /// The returned path is allocated and must be freed by the caller.
 pub fn findGitRoot(allocator: std.mem.Allocator, start_path: []const u8) ?[]const u8 {
     // Make path absolute if relative
-    const abs_path = std.fs.cwd().realpathAlloc(allocator, start_path) catch return null;
+    const abs_path = std.Io.Dir.cwd().realPathFileAlloc(io, start_path, allocator) catch return null;
     defer allocator.free(abs_path);
 
     var current: []const u8 = abs_path;
@@ -717,7 +722,7 @@ pub fn findGitRoot(allocator: std.mem.Allocator, start_path: []const u8) ?[]cons
         const git_path = std.fs.path.join(allocator, &.{ current, ".git" }) catch return null;
         defer allocator.free(git_path);
 
-        if (std.fs.cwd().statFile(git_path)) |stat| {
+        if (std.Io.Dir.cwd().statFile(io, git_path, .{})) |stat| {
             // .git can be a directory (normal repo) or file (submodule/worktree)
             if (stat.kind == .directory or stat.kind == .file) {
                 return allocator.dupe(u8, current) catch null;
@@ -747,14 +752,14 @@ pub fn loadAncestorGitignores(
     allocator: std.mem.Allocator,
 ) void {
     // Make both paths absolute for comparison
-    const abs_git_root = std.fs.cwd().realpathAlloc(allocator, git_root) catch return;
+    const abs_git_root = std.Io.Dir.cwd().realPathFileAlloc(io, git_root, allocator) catch return;
     defer allocator.free(abs_git_root);
 
-    const abs_search_path = std.fs.cwd().realpathAlloc(allocator, search_path) catch return;
+    const abs_search_path = std.Io.Dir.cwd().realPathFileAlloc(io, search_path, allocator) catch return;
     defer allocator.free(abs_search_path);
 
     // Get absolute cwd for converting back to relative paths
-    const abs_cwd = std.fs.cwd().realpathAlloc(allocator, ".") catch return;
+    const abs_cwd = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch return;
     defer allocator.free(abs_cwd);
 
     // search_path should be under or equal to git_root
@@ -763,7 +768,7 @@ pub fn loadAncestorGitignores(
     }
 
     // Build list of directories from git root to search path
-    var dirs = std.ArrayListUnmanaged([]const u8){};
+    var dirs: std.ArrayListUnmanaged([]const u8) = .empty;
     defer {
         for (dirs.items) |d| allocator.free(d);
         dirs.deinit(allocator);
@@ -1399,7 +1404,7 @@ test "findGitRoot: finds git root from repo root" {
         // Verify it contains .git
         const git_path = std.fs.path.join(allocator, &.{ git_root, ".git" }) catch unreachable;
         defer allocator.free(git_path);
-        const stat = std.fs.cwd().statFile(git_path) catch unreachable;
+        const stat = std.Io.Dir.cwd().statFile(io, git_path, .{}) catch unreachable;
         try std.testing.expect(stat.kind == .directory or stat.kind == .file);
     } else {
         // If we're not in a git repo (e.g., running tests in isolation), skip
@@ -1470,28 +1475,28 @@ test "loadAncestorGitignores: loads gitignore at git root" {
     const tmp_dir_raw = "/tmp/gitignore_ancestor_test1";
 
     // Clean up any previous test run
-    std.fs.cwd().deleteTree(tmp_dir_raw) catch {};
+    std.Io.Dir.cwd().deleteTree(io, tmp_dir_raw) catch {};
 
     // Create directory structure
-    std.fs.cwd().makePath(tmp_dir_raw) catch return;
-    defer std.fs.cwd().deleteTree(tmp_dir_raw) catch {};
+    std.Io.Dir.cwd().createDirPath(io, tmp_dir_raw) catch return;
+    defer std.Io.Dir.cwd().deleteTree(io, tmp_dir_raw) catch {};
 
     // Get the real path (resolves symlinks like /tmp -> /private/tmp on macOS)
-    const tmp_dir = std.fs.cwd().realpathAlloc(allocator, tmp_dir_raw) catch return;
+    const tmp_dir = std.Io.Dir.cwd().realPathFileAlloc(io, tmp_dir_raw, allocator) catch return;
     defer allocator.free(tmp_dir);
 
     // Create .git directory (to mark as git root)
     const git_dir = std.fs.path.join(allocator, &.{ tmp_dir, ".git" }) catch return;
     defer allocator.free(git_dir);
-    std.fs.cwd().makeDir(git_dir) catch return;
+    std.Io.Dir.cwd().createDir(io, git_dir, .default_dir) catch return;
 
     // Create .gitignore
     const gitignore_path = std.fs.path.join(allocator, &.{ tmp_dir, ".gitignore" }) catch return;
     defer allocator.free(gitignore_path);
     {
-        const file = std.fs.cwd().createFile(gitignore_path, .{}) catch return;
-        defer file.close();
-        file.writeAll("*.log\n") catch return;
+        const file = std.Io.Dir.cwd().createFile(io, gitignore_path, .{}) catch return;
+        defer file.close(io);
+        file.writeStreamingAll(io, "*.log\n") catch return;
     }
 
     // Test loading
@@ -1516,14 +1521,14 @@ test "loadAncestorGitignores: loads gitignores from multiple ancestors" {
     const tmp_dir_raw = "/tmp/gitignore_ancestor_test2";
 
     // Clean up any previous test run
-    std.fs.cwd().deleteTree(tmp_dir_raw) catch {};
+    std.Io.Dir.cwd().deleteTree(io, tmp_dir_raw) catch {};
 
     // Create directory structure: tmp_dir/subdir/deep
-    std.fs.cwd().makePath(tmp_dir_raw ++ "/subdir/deep") catch return;
-    defer std.fs.cwd().deleteTree(tmp_dir_raw) catch {};
+    std.Io.Dir.cwd().createDirPath(io, tmp_dir_raw ++ "/subdir/deep") catch return;
+    defer std.Io.Dir.cwd().deleteTree(io, tmp_dir_raw) catch {};
 
     // Get the real path (resolves symlinks like /tmp -> /private/tmp on macOS)
-    const tmp_dir = std.fs.cwd().realpathAlloc(allocator, tmp_dir_raw) catch return;
+    const tmp_dir = std.Io.Dir.cwd().realPathFileAlloc(io, tmp_dir_raw, allocator) catch return;
     defer allocator.free(tmp_dir);
 
     const subdir = std.fs.path.join(allocator, &.{ tmp_dir, "subdir" }) catch return;
@@ -1534,24 +1539,24 @@ test "loadAncestorGitignores: loads gitignores from multiple ancestors" {
     // Create .git directory at root
     const git_dir = std.fs.path.join(allocator, &.{ tmp_dir, ".git" }) catch return;
     defer allocator.free(git_dir);
-    std.fs.cwd().makeDir(git_dir) catch return;
+    std.Io.Dir.cwd().createDir(io, git_dir, .default_dir) catch return;
 
     // Create .gitignore at root
     const root_gitignore = std.fs.path.join(allocator, &.{ tmp_dir, ".gitignore" }) catch return;
     defer allocator.free(root_gitignore);
     {
-        const file = std.fs.cwd().createFile(root_gitignore, .{}) catch return;
-        defer file.close();
-        file.writeAll("*.root_ignored\n") catch return;
+        const file = std.Io.Dir.cwd().createFile(io, root_gitignore, .{}) catch return;
+        defer file.close(io);
+        file.writeStreamingAll(io, "*.root_ignored\n") catch return;
     }
 
     // Create .gitignore in subdir
     const subdir_gitignore = std.fs.path.join(allocator, &.{ subdir, ".gitignore" }) catch return;
     defer allocator.free(subdir_gitignore);
     {
-        const file = std.fs.cwd().createFile(subdir_gitignore, .{}) catch return;
-        defer file.close();
-        file.writeAll("*.sub_ignored\n") catch return;
+        const file = std.Io.Dir.cwd().createFile(io, subdir_gitignore, .{}) catch return;
+        defer file.close(io);
+        file.writeStreamingAll(io, "*.sub_ignored\n") catch return;
     }
 
     // Test loading from deep directory
@@ -1576,14 +1581,14 @@ test "loadAncestorGitignores: parent patterns loaded before child" {
     const tmp_dir_raw = "/tmp/gitignore_ancestor_test3";
 
     // Clean up any previous test run
-    std.fs.cwd().deleteTree(tmp_dir_raw) catch {};
+    std.Io.Dir.cwd().deleteTree(io, tmp_dir_raw) catch {};
 
     // Create directory structure
-    std.fs.cwd().makePath(tmp_dir_raw ++ "/subdir") catch return;
-    defer std.fs.cwd().deleteTree(tmp_dir_raw) catch {};
+    std.Io.Dir.cwd().createDirPath(io, tmp_dir_raw ++ "/subdir") catch return;
+    defer std.Io.Dir.cwd().deleteTree(io, tmp_dir_raw) catch {};
 
     // Get the real path (resolves symlinks like /tmp -> /private/tmp on macOS)
-    const tmp_dir = std.fs.cwd().realpathAlloc(allocator, tmp_dir_raw) catch return;
+    const tmp_dir = std.Io.Dir.cwd().realPathFileAlloc(io, tmp_dir_raw, allocator) catch return;
     defer allocator.free(tmp_dir);
 
     const subdir = std.fs.path.join(allocator, &.{ tmp_dir, "subdir" }) catch return;
@@ -1592,24 +1597,24 @@ test "loadAncestorGitignores: parent patterns loaded before child" {
     // Create .git directory at root
     const git_dir = std.fs.path.join(allocator, &.{ tmp_dir, ".git" }) catch return;
     defer allocator.free(git_dir);
-    std.fs.cwd().makeDir(git_dir) catch return;
+    std.Io.Dir.cwd().createDir(io, git_dir, .default_dir) catch return;
 
     // Create .gitignore at root that ignores *.log
     const root_gitignore = std.fs.path.join(allocator, &.{ tmp_dir, ".gitignore" }) catch return;
     defer allocator.free(root_gitignore);
     {
-        const file = std.fs.cwd().createFile(root_gitignore, .{}) catch return;
-        defer file.close();
-        file.writeAll("*.log\n") catch return;
+        const file = std.Io.Dir.cwd().createFile(io, root_gitignore, .{}) catch return;
+        defer file.close(io);
+        file.writeStreamingAll(io, "*.log\n") catch return;
     }
 
     // Create .gitignore in subdir that negates important.log
     const subdir_gitignore = std.fs.path.join(allocator, &.{ subdir, ".gitignore" }) catch return;
     defer allocator.free(subdir_gitignore);
     {
-        const file = std.fs.cwd().createFile(subdir_gitignore, .{}) catch return;
-        defer file.close();
-        file.writeAll("!important.log\n") catch return;
+        const file = std.Io.Dir.cwd().createFile(io, subdir_gitignore, .{}) catch return;
+        defer file.close(io);
+        file.writeStreamingAll(io, "!important.log\n") catch return;
     }
 
     // Test loading
@@ -1637,19 +1642,19 @@ test "loadAncestorGitignores: handles missing gitignore gracefully" {
     const tmp_dir = "/tmp/gitignore_ancestor_test4";
 
     // Clean up any previous test run
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    std.Io.Dir.cwd().deleteTree(io, tmp_dir) catch {};
 
     // Create directory structure without any .gitignore files
     const subdir = std.fs.path.join(allocator, &.{ tmp_dir, "subdir" }) catch return;
     defer allocator.free(subdir);
 
-    std.fs.cwd().makePath(subdir) catch return;
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(io, subdir) catch return;
+    defer std.Io.Dir.cwd().deleteTree(io, tmp_dir) catch {};
 
     // Create .git directory at root (but no .gitignore)
     const git_dir = std.fs.path.join(allocator, &.{ tmp_dir, ".git" }) catch return;
     defer allocator.free(git_dir);
-    std.fs.cwd().makeDir(git_dir) catch return;
+    std.Io.Dir.cwd().createDir(io, git_dir, .default_dir) catch return;
 
     // Test loading - should not crash
     var matcher = GitignoreMatcher.init(allocator);
@@ -1667,27 +1672,27 @@ test "loadAncestorGitignores: search path equals git root" {
     const tmp_dir_raw = "/tmp/gitignore_ancestor_test5";
 
     // Clean up any previous test run
-    std.fs.cwd().deleteTree(tmp_dir_raw) catch {};
+    std.Io.Dir.cwd().deleteTree(io, tmp_dir_raw) catch {};
 
-    std.fs.cwd().makePath(tmp_dir_raw) catch return;
-    defer std.fs.cwd().deleteTree(tmp_dir_raw) catch {};
+    std.Io.Dir.cwd().createDirPath(io, tmp_dir_raw) catch return;
+    defer std.Io.Dir.cwd().deleteTree(io, tmp_dir_raw) catch {};
 
     // Get the real path (resolves symlinks like /tmp -> /private/tmp on macOS)
-    const tmp_dir = std.fs.cwd().realpathAlloc(allocator, tmp_dir_raw) catch return;
+    const tmp_dir = std.Io.Dir.cwd().realPathFileAlloc(io, tmp_dir_raw, allocator) catch return;
     defer allocator.free(tmp_dir);
 
     // Create .git directory
     const git_dir = std.fs.path.join(allocator, &.{ tmp_dir, ".git" }) catch return;
     defer allocator.free(git_dir);
-    std.fs.cwd().makeDir(git_dir) catch return;
+    std.Io.Dir.cwd().createDir(io, git_dir, .default_dir) catch return;
 
     // Create .gitignore
     const gitignore_path = std.fs.path.join(allocator, &.{ tmp_dir, ".gitignore" }) catch return;
     defer allocator.free(gitignore_path);
     {
-        const file = std.fs.cwd().createFile(gitignore_path, .{}) catch return;
-        defer file.close();
-        file.writeAll("*.tmp\n") catch return;
+        const file = std.Io.Dir.cwd().createFile(io, gitignore_path, .{}) catch return;
+        defer file.close(io);
+        file.writeStreamingAll(io, "*.tmp\n") catch return;
     }
 
     // Test loading when search path equals git root
@@ -1710,26 +1715,26 @@ test "loadAncestorGitignores: search path not under git root" {
     const search_path = "/tmp/gitignore_ancestor_test6_other";
 
     // Clean up any previous test run
-    std.fs.cwd().deleteTree(git_root) catch {};
-    std.fs.cwd().deleteTree(search_path) catch {};
+    std.Io.Dir.cwd().deleteTree(io, git_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io, search_path) catch {};
 
-    std.fs.cwd().makePath(git_root) catch return;
-    std.fs.cwd().makePath(search_path) catch return;
-    defer std.fs.cwd().deleteTree(git_root) catch {};
-    defer std.fs.cwd().deleteTree(search_path) catch {};
+    std.Io.Dir.cwd().createDirPath(io, git_root) catch return;
+    std.Io.Dir.cwd().createDirPath(io, search_path) catch return;
+    defer std.Io.Dir.cwd().deleteTree(io, git_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, search_path) catch {};
 
     // Create .git directory in git_root
     const git_dir = std.fs.path.join(allocator, &.{ git_root, ".git" }) catch return;
     defer allocator.free(git_dir);
-    std.fs.cwd().makeDir(git_dir) catch return;
+    std.Io.Dir.cwd().createDir(io, git_dir, .default_dir) catch return;
 
     // Create .gitignore in git_root
     const gitignore_path = std.fs.path.join(allocator, &.{ git_root, ".gitignore" }) catch return;
     defer allocator.free(gitignore_path);
     {
-        const file = std.fs.cwd().createFile(gitignore_path, .{}) catch return;
-        defer file.close();
-        file.writeAll("*.secret\n") catch return;
+        const file = std.Io.Dir.cwd().createFile(io, gitignore_path, .{}) catch return;
+        defer file.close(io);
+        file.writeStreamingAll(io, "*.secret\n") catch return;
     }
 
     // Test loading with search path not under git root - should be a no-op

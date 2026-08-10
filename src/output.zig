@@ -1,6 +1,7 @@
 const std = @import("std");
 const main = @import("main.zig");
 const matcher_mod = @import("matcher.zig");
+const io = std.Io.Threaded.global_single_threaded.io();
 
 // ANSI color codes
 const Color = struct {
@@ -54,7 +55,7 @@ pub const FileBuffer = struct {
         show_line_numbers: bool,
     ) FileBuffer {
         return .{
-            .buffer = .{},
+            .buffer = .empty,
             .allocator = allocator,
             .match_count = 0,
             .config = config,
@@ -75,7 +76,9 @@ pub const FileBuffer = struct {
     }
 
     pub fn addMatchWithMatcher(self: *FileBuffer, match_data: Match, pattern_matcher: ?*const matcher_mod.Matcher) !void {
-        const writer = self.buffer.writer(self.allocator);
+        var allocating: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &self.buffer);
+        defer self.buffer = allocating.toArrayList();
+        const writer = &allocating.writer;
 
         if (self.use_heading) {
             // Grouped output format:
@@ -261,11 +264,11 @@ pub const FileBuffer = struct {
 pub const Output = struct {
     const DIRECT_BUFFER_SIZE = 64 * 1024;
 
-    file: std.fs.File,
+    file: std.Io.File,
     config: main.Config,
     total_count: std.atomic.Value(usize),
     matched: std.atomic.Value(bool),
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
     use_color: bool,
     use_heading: bool,
     show_line_numbers: bool,
@@ -274,8 +277,8 @@ pub const Output = struct {
     direct_len: usize,
     direct_first_written: bool,
 
-    pub fn init(file: std.fs.File, config: main.Config) Output {
-        const is_tty = file.isTty();
+    pub fn init(file: std.Io.File, config: main.Config) Output {
+        const is_tty = file.isTty(io) catch false;
 
         // Determine color mode based on config and TTY status
         const use_color = switch (config.color) {
@@ -297,7 +300,7 @@ pub const Output = struct {
             .config = config,
             .total_count = std.atomic.Value(usize).init(0),
             .matched = std.atomic.Value(bool).init(false),
-            .mutex = .{},
+            .mutex = .init,
             .use_color = use_color,
             .use_heading = use_heading,
             .show_line_numbers = config.showLineNumbers(is_tty),
@@ -332,8 +335,7 @@ pub const Output = struct {
     pub fn writeMatchDirect(self: *Output, match_data: Match, pattern_matcher: ?*const matcher_mod.Matcher) !void {
         const show_line_numbers = self.show_line_numbers;
         var buf: [128]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        const writer = fbs.writer();
+        var writer: std.Io.Writer = .fixed(&buf);
 
         if (self.use_heading) {
             // Heading format: just line_number:content (no filename for single source)
@@ -365,7 +367,7 @@ pub const Output = struct {
             }
         }
 
-        const prefix = fbs.getWritten();
+        const prefix = writer.buffered();
         try self.writeDirectPart(prefix);
 
         // Print line content with highlighted match
@@ -420,13 +422,13 @@ pub const Output = struct {
         if (bytes.len == 0) return;
 
         if (!self.direct_first_written) {
-            try self.file.writeAll(bytes);
+            try self.file.writeStreamingAll(io, bytes);
             return;
         }
 
         if (bytes.len > self.direct_buffer.len) {
             try self.flushDirect();
-            try self.file.writeAll(bytes);
+            try self.file.writeStreamingAll(io, bytes);
             return;
         }
 
@@ -443,7 +445,7 @@ pub const Output = struct {
 
     pub fn flushDirect(self: *Output) !void {
         if (self.direct_len == 0) return;
-        try self.file.writeAll(self.direct_buffer[0..self.direct_len]);
+        try self.file.writeStreamingAll(io, self.direct_buffer[0..self.direct_len]);
         self.direct_len = 0;
     }
 
@@ -451,20 +453,20 @@ pub const Output = struct {
     pub fn flushFileBuffer(self: *Output, file_buf: *FileBuffer) !void {
         if (!file_buf.hasMatches()) return;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         // Add separator between files (only in heading mode)
         const grouped = self.use_heading and !self.config.files_with_matches;
         if (grouped and self.needs_separator) {
-            try self.file.writeAll("\n");
+            try self.file.writeStreamingAll(io, "\n");
         }
         if (grouped) {
             self.needs_separator = true;
         }
 
         // Write entire buffer in one go
-        try self.file.writeAll(file_buf.getBuffer());
+        try self.file.writeStreamingAll(io, file_buf.getBuffer());
         self.matched.store(true, .monotonic);
 
         // Update count
@@ -474,11 +476,11 @@ pub const Output = struct {
     }
 
     pub fn printFileCount(self: *Output, file_path: []const u8, count: usize) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         var buf: [4096]u8 = undefined;
-        var writer = self.file.writer(&buf);
+        var writer = self.file.writerStreaming(io, &buf);
 
         if (self.config.is_single_source) {
             // ripgrep does not color counts, even when color is forced.
@@ -500,12 +502,11 @@ pub const Output = struct {
     }
 
     pub fn printBinaryMessage(self: *Output, file_path: []const u8, byte_offset: usize, quit: bool) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         var buf: [4096]u8 = undefined;
-        var stream = std.io.fixedBufferStream(&buf);
-        const writer = stream.writer();
+        var writer: std.Io.Writer = .fixed(&buf);
         if (quit) {
             if (!self.config.is_single_source) try writer.print("{s}: ", .{file_path});
             try writer.print("WARNING: stopped searching binary file after match (found \"\\0\" byte around offset {d})\n", .{byte_offset});
@@ -513,16 +514,16 @@ pub const Output = struct {
             if (!self.config.is_single_source) try writer.print("{s}: ", .{file_path});
             try writer.print("binary file matches (found \"\\0\" byte around offset {d})\n", .{byte_offset});
         }
-        try self.file.writeAll(stream.getWritten());
+        try self.file.writeStreamingAll(io, writer.buffered());
         self.matched.store(true, .monotonic);
     }
 
     pub fn printTotalCount(self: *Output) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         var buf: [256]u8 = undefined;
-        var writer = self.file.writer(&buf);
+        var writer = self.file.writerStreaming(io, &buf);
         const count = self.total_count.load(.monotonic);
         try writer.interface.print("{d}\n", .{count});
         try writer.interface.flush();

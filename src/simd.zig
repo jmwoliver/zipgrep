@@ -1357,11 +1357,12 @@ fn findAnyTeddy(
             break :blk first_members & second_members & third_members;
         } else first_members & second_members;
         var lanes: MaskType = @bitCast(candidates != zero);
+        const candidate_bytes: [VECTOR_WIDTH]u8 = @bitCast(candidates);
 
         while (lanes != 0) {
             const lane = @ctz(lanes);
             const match_start = pos + lane;
-            var pattern_bits = candidates[lane];
+            var pattern_bits = candidate_bytes[lane];
             while (pattern_bits != 0) {
                 const pattern_idx = @ctz(pattern_bits);
                 const pattern = patterns[pattern_idx];

@@ -19,7 +19,7 @@ zipgrep recursively searches directories for a regex pattern while respecting `.
 - **Smart output formatting** - auto-detects TTY vs pipe for heading/color defaults
 - **Bounded I/O memory** using rolling stream buffers or reclaimable 8 MiB mmap windows
 - **Early termination** for `-q` and `-l`, including cross-worker cancellation
-- **Small binary** - about 2.2 MiB versus 5.2 MiB for the Linux musl ripgrep binary used below
+- **Small binary** - about 4.5 MiB versus 5.2 MiB for the Linux musl ripgrep binary used below
 
 ## Installation
 
@@ -31,7 +31,7 @@ brew install jmwoliver/tap/zipgrep
 
 ### Building from source
 
-Requires [Zig](https://ziglang.org/) 0.15.2.
+Requires [Zig](https://ziglang.org/) 0.16.0.
 
 ```bash
 # Clone the repository
@@ -322,7 +322,7 @@ This comparison targets ripgrep 15.2.0. Ripgrep uses its Rust finite-automata re
 | JSON output | ✗ | ✓ |
 | Output replacement | ✗ | ✓; changes output, not files |
 | Encoding/transcoding | ✗ raw bytes plus UTF-8-aware regex paths | ✓ BOM detection and `--encoding` |
-| Binary size | About 2.2 MiB | About 5.2 MiB for the Linux musl binary used in the benchmarks |
+| Binary size | About 4.5 MiB | About 5.2 MiB for the Linux musl binary used in the benchmarks |
 
 ### What zipgrep Supports
 

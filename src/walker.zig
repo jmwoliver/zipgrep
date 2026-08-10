@@ -5,6 +5,7 @@ const reader = @import("reader.zig");
 const output = @import("output.zig");
 const gitignore = @import("gitignore.zig");
 const parallel_walker = @import("parallel_walker.zig");
+const io = std.Io.Threaded.global_single_threaded.io();
 
 pub const Walker = struct {
     allocator: std.mem.Allocator,
@@ -42,7 +43,7 @@ pub const Walker = struct {
         // from the repo root down to the search path, ensuring parent patterns apply
         if (self.ignore_matcher) |im| {
             for (self.config.paths) |path| {
-                const stat = std.fs.cwd().statFile(path) catch continue;
+                const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch continue;
                 if (stat.kind == .directory) {
                     // Find git repository root by walking up from search path
                     if (gitignore.findGitRoot(self.allocator, path)) |git_root| {
@@ -77,7 +78,7 @@ pub const Walker = struct {
     /// Sequential implementation (original behavior)
     fn walkSequential(self: *Walker) !void {
         // Collect all files first, then search sequentially
-        var files = std.ArrayListUnmanaged([]const u8){};
+        var files: std.ArrayListUnmanaged([]const u8) = .empty;
         defer {
             for (files.items) |f| self.allocator.free(f);
             files.deinit(self.allocator);
@@ -95,7 +96,7 @@ pub const Walker = struct {
                 continue;
             }
 
-            const stat = std.fs.cwd().statFile(path) catch continue;
+            const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch continue;
             if (stat.kind == .directory) {
                 try self.collectFiles(path, 0, &files);
             } else {
@@ -140,8 +141,8 @@ pub const Walker = struct {
             if (depth >= max) return;
         }
 
-        var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch return;
-        defer dir.close();
+        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return;
+        defer dir.close(io);
 
         // Load .gitignore from this directory (scoped to this dir and below)
         if (depth > 0) { // Root already loaded in walk()
@@ -149,7 +150,7 @@ pub const Walker = struct {
         }
 
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(io)) |entry| {
             // Skip hidden files/dirs unless --hidden is set
             // Exception: .gitignore files are always searched
             if (!self.config.hidden and entry.name.len > 0 and entry.name[0] == '.') {
@@ -198,7 +199,7 @@ pub const Walker = struct {
     }
 
     /// Query available bytes in stdin using FIONREAD ioctl for pre-allocation hint
-    fn getStdinSizeHint(file: std.fs.File) usize {
+    fn getStdinSizeHint(file: std.Io.File) usize {
         const builtin = @import("builtin");
         const FIONREAD: u32 = switch (builtin.os.tag) {
             .macos, .ios, .tvos, .watchos => 0x4004667f,
@@ -217,7 +218,7 @@ pub const Walker = struct {
 
     /// Search stdin for matches
     fn searchStdin(self: *Walker) !void {
-        const stdin = std.fs.File.stdin();
+        const stdin = std.Io.File.stdin();
 
         // Read all stdin into buffer
         var content: std.ArrayList(u8) = .empty;
@@ -231,7 +232,7 @@ pub const Walker = struct {
 
         var read_buf: [64 * 1024]u8 = undefined;
         while (true) {
-            const bytes_read = stdin.read(&read_buf) catch break;
+            const bytes_read = stdin.readStreaming(io, &.{&read_buf}) catch break;
             if (bytes_read == 0) break;
             content.appendSlice(self.allocator, read_buf[0..bytes_read]) catch break;
         }
@@ -369,7 +370,7 @@ test "walker initialization" {
     var ignore_matcher = gitignore.GitignoreMatcher.init(allocator);
     defer ignore_matcher.deinit();
 
-    const stdout = std.fs.File.stdout();
+    const stdout = std.Io.File.stdout();
     var out = output.Output.init(stdout, config);
 
     var w = try Walker.init(
@@ -397,7 +398,7 @@ test "walker init without ignore matcher" {
     var pattern_matcher = try matcher_mod.Matcher.init(allocator, "test", false);
     defer pattern_matcher.deinit();
 
-    const stdout = std.fs.File.stdout();
+    const stdout = std.Io.File.stdout();
     var out = output.Output.init(stdout, config);
 
     var w = try Walker.init(
@@ -423,7 +424,7 @@ test "walker deinit does not crash" {
     var pattern_matcher = try matcher_mod.Matcher.init(allocator, "test", false);
     defer pattern_matcher.deinit();
 
-    const stdout = std.fs.File.stdout();
+    const stdout = std.Io.File.stdout();
     var out = output.Output.init(stdout, config);
 
     var w = try Walker.init(

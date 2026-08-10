@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const matcher_mod = @import("matcher.zig");
 const simd = @import("simd.zig");
 const aho_corasick = @import("aho_corasick.zig");
+const io = std.Io.Threaded.global_single_threaded.io();
 
 /// Line iterator for processing file content line by line
 pub const LineIterator = struct {
@@ -171,7 +172,7 @@ test "LineIterator windows line endings" {
 /// - Bounded per-worker memory and predictable cache locality
 /// - Efficient OS read-ahead for sequential access
 pub const StreamingLineReader = struct {
-    file: std.fs.File,
+    file: std.Io.File,
     owns_file: bool,
     buffer: []u8,
     mapped_data: ?[]align(std.heap.page_size_min) u8,
@@ -218,16 +219,16 @@ pub const StreamingLineReader = struct {
     }
 
     pub fn initWithOptions(allocator: std.mem.Allocator, path: []const u8, binary_scan_all: bool, buffer_size: usize) !StreamingLineReader {
-        const file = try std.fs.cwd().openFile(path, .{});
-        errdefer file.close();
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        errdefer file.close(io);
 
         if (!binary_scan_all and comptime builtin.os.tag != .windows) {
-            const stat = try file.stat();
+            const stat = try file.stat(io);
             if (stat.kind == .file and stat.size >= MMAP_MIN_SIZE and stat.size <= std.math.maxInt(usize)) {
                 const mapped = try std.posix.mmap(
                     null,
                     @intCast(stat.size),
-                    std.posix.PROT.READ,
+                    .{ .READ = true },
                     .{ .TYPE = .PRIVATE },
                     file.handle,
                     0,
@@ -266,11 +267,11 @@ pub const StreamingLineReader = struct {
 
     /// Initialize a streaming reader around an existing file handle. When
     /// `owns_file` is false, deinit leaves the handle open (used for stdin).
-    pub fn initFile(allocator: std.mem.Allocator, file: std.fs.File, owns_file: bool) !StreamingLineReader {
+    pub fn initFile(allocator: std.mem.Allocator, file: std.Io.File, owns_file: bool) !StreamingLineReader {
         return initFileWithBuffer(allocator, file, owns_file, DEFAULT_BUFFER_SIZE);
     }
 
-    pub fn initFileWithBuffer(allocator: std.mem.Allocator, file: std.fs.File, owns_file: bool, buffer_size: usize) !StreamingLineReader {
+    pub fn initFileWithBuffer(allocator: std.mem.Allocator, file: std.Io.File, owns_file: bool, buffer_size: usize) !StreamingLineReader {
 
         // Hint to kernel that we'll read sequentially - improves prefetching
         // This matches mmap's MADV_SEQUENTIAL behavior
@@ -306,7 +307,7 @@ pub const StreamingLineReader = struct {
         } else {
             self.allocator.free(self.buffer);
         }
-        if (self.owns_file) self.file.close();
+        if (self.owns_file) self.file.close(io);
     }
 
     /// Check if this is a binary file (call after at least one next() call)
@@ -391,7 +392,10 @@ pub const StreamingLineReader = struct {
 
         // Read more data into buffer
         const read_start = self.data_end;
-        const bytes_read = try self.file.read(self.buffer[self.data_end..]);
+        const bytes_read = self.file.readStreaming(io, &.{self.buffer[self.data_end..]}) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => return err,
+        };
 
         if (bytes_read == 0) {
             self.eof_reached = true;
@@ -943,13 +947,14 @@ test "StreamingLineReader basic" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("test.txt", .{});
-    try file.writeAll("line1\nline2\nline3");
-    file.close();
+    const file = try tmp_dir.dir.createFile(io, "test.txt", .{});
+    try file.writeStreamingAll(io, "line1\nline2\nline3");
+    file.close(io);
 
     // Get the full path
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp_dir.dir.realpath("test.txt", &path_buf);
+    const path_len = try tmp_dir.dir.realPathFile(io, "test.txt", &path_buf);
+    const path = path_buf[0..path_len];
 
     var reader = try StreamingLineReader.init(allocator, path);
     defer reader.deinit();
@@ -975,11 +980,12 @@ test "StreamingLineReader empty file" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("empty.txt", .{});
-    file.close();
+    const file = try tmp_dir.dir.createFile(io, "empty.txt", .{});
+    file.close(io);
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp_dir.dir.realpath("empty.txt", &path_buf);
+    const path_len = try tmp_dir.dir.realPathFile(io, "empty.txt", &path_buf);
+    const path = path_buf[0..path_len];
 
     var reader = try StreamingLineReader.init(allocator, path);
     defer reader.deinit();
@@ -993,12 +999,13 @@ test "StreamingLineReader trailing newline" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("trailing.txt", .{});
-    try file.writeAll("line1\nline2\n");
-    file.close();
+    const file = try tmp_dir.dir.createFile(io, "trailing.txt", .{});
+    try file.writeStreamingAll(io, "line1\nline2\n");
+    file.close(io);
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp_dir.dir.realpath("trailing.txt", &path_buf);
+    const path_len = try tmp_dir.dir.realPathFile(io, "trailing.txt", &path_buf);
+    const path = path_buf[0..path_len];
 
     var reader = try StreamingLineReader.init(allocator, path);
     defer reader.deinit();
@@ -1019,12 +1026,13 @@ test "StreamingLineReader binary detection" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("binary.txt", .{});
-    try file.writeAll("text\x00binary");
-    file.close();
+    const file = try tmp_dir.dir.createFile(io, "binary.txt", .{});
+    try file.writeStreamingAll(io, "text\x00binary");
+    file.close(io);
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp_dir.dir.realpath("binary.txt", &path_buf);
+    const path_len = try tmp_dir.dir.realPathFile(io, "binary.txt", &path_buf);
+    const path = path_buf[0..path_len];
 
     var reader = try StreamingLineReader.init(allocator, path);
     defer reader.deinit();
@@ -1040,12 +1048,13 @@ test "StreamingLineReader preserves matches from reads before binary data" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("late-binary.txt", .{});
-    try file.writeAll("NEEDLE first\npadding line\npadding line\n\x00tail\n");
-    file.close();
+    const file = try tmp_dir.dir.createFile(io, "late-binary.txt", .{});
+    try file.writeStreamingAll(io, "NEEDLE first\npadding line\npadding line\n\x00tail\n");
+    file.close(io);
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp_dir.dir.realpath("late-binary.txt", &path_buf);
+    const path_len = try tmp_dir.dir.realPathFile(io, "late-binary.txt", &path_buf);
+    const path = path_buf[0..path_len];
 
     var stream = try StreamingLineReader.initWithOptions(allocator, path, true, 16);
     defer stream.deinit();
@@ -1074,12 +1083,13 @@ test "sparse count fallback still searches explicit binary data" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("sparse-binary.txt", .{});
-    try file.writeAll("hit\x00padding\n");
-    file.close();
+    const file = try tmp_dir.dir.createFile(io, "sparse-binary.txt", .{});
+    try file.writeStreamingAll(io, "hit\x00padding\n");
+    file.close(io);
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp_dir.dir.realpath("sparse-binary.txt", &path_buf);
+    const path_len = try tmp_dir.dir.realPathFile(io, "sparse-binary.txt", &path_buf);
+    const path = path_buf[0..path_len];
     var stream = try StreamingLineReader.initWithOptions(allocator, path, false, 4096);
     defer stream.deinit();
     var matcher = try matcher_mod.Matcher.init(allocator, "hit", false, false);
@@ -1105,12 +1115,13 @@ test "explicit binary regex count searches original NUL byte" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("binary-regex.txt", .{});
-    try file.writeAll("foo\x00bar\nfoo bar\n");
-    file.close();
+    const file = try tmp_dir.dir.createFile(io, "binary-regex.txt", .{});
+    try file.writeStreamingAll(io, "foo\x00bar\nfoo bar\n");
+    file.close(io);
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp_dir.dir.realpath("binary-regex.txt", &path_buf);
+    const path_len = try tmp_dir.dir.realPathFile(io, "binary-regex.txt", &path_buf);
+    const path = path_buf[0..path_len];
     var stream = try StreamingLineReader.initWithOptions(allocator, path, false, 4096);
     defer stream.deinit();
     var matcher = try matcher_mod.Matcher.init(allocator, "foo.*bar", false, false);
@@ -1145,12 +1156,13 @@ test "mapped fast count continues after a late binary match" {
     for (0..line_count) |i| @memcpy(content[i * line.len ..][0..line.len], line);
     content[binary_line * line.len + 5] = 0;
 
-    const file = try tmp_dir.dir.createFile("late-binary.txt", .{});
-    try file.writeAll(content);
-    file.close();
+    const file = try tmp_dir.dir.createFile(io, "late-binary.txt", .{});
+    try file.writeStreamingAll(io, content);
+    file.close(io);
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp_dir.dir.realpath("late-binary.txt", &path_buf);
+    const path_len = try tmp_dir.dir.realPathFile(io, "late-binary.txt", &path_buf);
+    const path = path_buf[0..path_len];
     var stream = try StreamingLineReader.initWithOptions(allocator, path, false, 64 * 1024);
     defer stream.deinit();
     try std.testing.expect(stream.mapped_data != null);
@@ -1168,16 +1180,17 @@ test "mapped reader searches and releases line-aligned windows" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("mapped.txt", .{});
-    try file.writeAll("NEEDLE before\n");
+    const file = try tmp_dir.dir.createFile(io, "mapped.txt", .{});
+    try file.writeStreamingAll(io, "NEEDLE before\n");
     var padding: [4096]u8 = [_]u8{'x'} ** 4096;
     padding[padding.len - 1] = '\n';
-    for (0..2050) |_| try file.writeAll(&padding);
-    try file.writeAll("NEEDLE after\n");
-    file.close();
+    for (0..2050) |_| try file.writeStreamingAll(io, &padding);
+    try file.writeStreamingAll(io, "NEEDLE after\n");
+    file.close(io);
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp_dir.dir.realpath("mapped.txt", &path_buf);
+    const path_len = try tmp_dir.dir.realPathFile(io, "mapped.txt", &path_buf);
+    const path = path_buf[0..path_len];
     var stream = try StreamingLineReader.initWithOptions(allocator, path, false, 64 * 1024);
     defer stream.deinit();
     try std.testing.expect(stream.mapped_data != null);
@@ -1207,12 +1220,13 @@ test "StreamingLineReader consecutive newlines" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const file = try tmp_dir.dir.createFile("consecutive.txt", .{});
-    try file.writeAll("line1\n\nline3");
-    file.close();
+    const file = try tmp_dir.dir.createFile(io, "consecutive.txt", .{});
+    try file.writeStreamingAll(io, "line1\n\nline3");
+    file.close(io);
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp_dir.dir.realpath("consecutive.txt", &path_buf);
+    const path_len = try tmp_dir.dir.realPathFile(io, "consecutive.txt", &path_buf);
+    const path = path_buf[0..path_len];
 
     var reader = try StreamingLineReader.init(allocator, path);
     defer reader.deinit();

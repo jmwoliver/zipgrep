@@ -644,7 +644,7 @@ pub const AlternationInfo = struct {
 pub fn extractAlternationLiterals(allocator: std.mem.Allocator, pattern: []const u8) !?AlternationInfo {
     if (pattern.len == 0) return null;
 
-    var literals = std.ArrayListUnmanaged([]const u8){};
+    var literals: std.ArrayListUnmanaged([]const u8) = .empty;
     defer {
         for (literals.items) |lit| allocator.free(lit);
         literals.deinit(allocator);
@@ -707,7 +707,7 @@ pub fn extractRepeatedAlternationLiterals(allocator: std.mem.Allocator, pattern:
 }
 
 fn decodePureLiteral(allocator: std.mem.Allocator, pattern: []const u8) !?[]u8 {
-    var decoded = std.ArrayListUnmanaged(u8){};
+    var decoded: std.ArrayListUnmanaged(u8) = .empty;
     defer decoded.deinit(allocator);
 
     var pos: usize = 0;
@@ -764,9 +764,9 @@ pub const FixedAlternationInfo = struct {
 pub fn extractFixedAlternation(allocator: std.mem.Allocator, pattern: []const u8) !?FixedAlternationInfo {
     if (std.mem.indexOfScalar(u8, pattern, '|') == null) return null;
 
-    var branches = std.ArrayListUnmanaged(FixedAlternationBranch){};
+    var branches: std.ArrayListUnmanaged(FixedAlternationBranch) = .empty;
     defer branches.deinit(allocator);
-    var literals = std.ArrayListUnmanaged([]const u8){};
+    var literals: std.ArrayListUnmanaged([]const u8) = .empty;
     defer literals.deinit(allocator);
     var max_required_offset: usize = 0;
     var max_branch_len: usize = 0;

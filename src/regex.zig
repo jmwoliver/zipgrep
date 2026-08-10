@@ -1523,11 +1523,11 @@ pub const Regex = struct {
 
     fn buildDfa(self: *const Regex, unanchored: bool) error{ OutOfMemory, StateLimit }!Dfa {
         const allocator = self.allocator;
-        var subsets = std.ArrayListUnmanaged(StateBitset){};
+        var subsets: std.ArrayListUnmanaged(StateBitset) = .empty;
         defer subsets.deinit(allocator);
-        var transitions = std.ArrayListUnmanaged(u16){};
+        var transitions: std.ArrayListUnmanaged(u16) = .empty;
         errdefer transitions.deinit(allocator);
-        var accepting = std.ArrayListUnmanaged(bool){};
+        var accepting: std.ArrayListUnmanaged(bool) = .empty;
         errdefer accepting.deinit(allocator);
 
         var initial = StateBitset.init();
@@ -1588,9 +1588,9 @@ pub const Regex = struct {
 
     fn buildWordDfa(self: *const Regex) error{ OutOfMemory, StateLimit }!WordDfa {
         const allocator = self.allocator;
-        var subsets = std.ArrayListUnmanaged(StateBitset){};
+        var subsets: std.ArrayListUnmanaged(StateBitset) = .empty;
         defer subsets.deinit(allocator);
-        var transitions = std.ArrayListUnmanaged(u16){};
+        var transitions: std.ArrayListUnmanaged(u16) = .empty;
         errdefer transitions.deinit(allocator);
 
         var initial = StateBitset.init();
@@ -1663,8 +1663,8 @@ const Compiler = struct {
     fn init(allocator: std.mem.Allocator) Compiler {
         return .{
             .allocator = allocator,
-            .states = .{},
-            .class_ranges = .{},
+            .states = .empty,
+            .class_ranges = .empty,
             .pos = 0,
             .pattern = undefined,
         };
@@ -1779,7 +1779,7 @@ const Compiler = struct {
 
         // Empty pattern - return epsilon transition to self
         const empty = try self.addState(.{ .transition = .epsilon });
-        var out = std.ArrayListUnmanaged(usize){};
+        var out: std.ArrayListUnmanaged(usize) = .empty;
         try out.append(self.allocator, empty);
         return Fragment{ .start = empty, .out = out };
     }
@@ -1812,7 +1812,7 @@ const Compiler = struct {
             '^', '$' => {
                 self.pos += 1;
                 const state = try self.addState(.{ .transition = if (c == '^') .line_start else .line_end });
-                var out = std.ArrayListUnmanaged(usize){};
+                var out: std.ArrayListUnmanaged(usize) = .empty;
                 try out.append(self.allocator, state);
                 return Fragment{ .start = state, .out = out };
             },
@@ -1927,7 +1927,7 @@ const Compiler = struct {
 
     fn createSingleState(self: *Compiler, transition: Transition) CompileError!Fragment {
         const state = try self.addState(.{ .transition = transition });
-        var out = std.ArrayListUnmanaged(usize){};
+        var out: std.ArrayListUnmanaged(usize) = .empty;
         try out.append(self.allocator, state);
         return Fragment{ .start = state, .out = out };
     }
@@ -1947,7 +1947,7 @@ const Compiler = struct {
                 // Loop back: fragment's end points back to split
                 self.patch(frag.out, split);
                 frag.out.deinit(self.allocator);
-                frag.out = .{};
+                frag.out = .empty;
 
                 // The "out" of this fragment is split's out2 (the skip path)
                 // We need patch() to set out2 instead of out1 for split
@@ -1965,7 +1965,7 @@ const Compiler = struct {
                 // Update split to have both paths
                 self.states.items[split].out2 = skip;
 
-                var out = std.ArrayListUnmanaged(usize){};
+                var out: std.ArrayListUnmanaged(usize) = .empty;
                 errdefer out.deinit(self.allocator);
                 try out.append(self.allocator, skip);
 
@@ -1980,13 +1980,13 @@ const Compiler = struct {
                 });
                 self.patch(frag.out, split);
                 frag.out.deinit(self.allocator);
-                frag.out = .{};
+                frag.out = .empty;
 
                 // Create skip state for the "done matching" path
                 const skip = try self.addState(.{ .transition = .epsilon });
                 self.states.items[split].out2 = skip;
 
-                var out = std.ArrayListUnmanaged(usize){};
+                var out: std.ArrayListUnmanaged(usize) = .empty;
                 errdefer out.deinit(self.allocator);
                 try out.append(self.allocator, skip);
 
@@ -2004,14 +2004,14 @@ const Compiler = struct {
                 });
 
                 // Both fragment's end AND skip need to go to next
-                var new_out = std.ArrayListUnmanaged(usize){};
+                var new_out: std.ArrayListUnmanaged(usize) = .empty;
                 errdefer new_out.deinit(self.allocator);
                 for (frag.out.items) |out_state| {
                     try new_out.append(self.allocator, out_state);
                 }
                 try new_out.append(self.allocator, skip);
                 frag.out.deinit(self.allocator);
-                frag.out = .{};
+                frag.out = .empty;
 
                 return Fragment{ .start = split, .out = new_out };
             },
@@ -2054,13 +2054,13 @@ const Compiler = struct {
             atom.out.deinit(self.allocator);
             atom_owned = false;
             const empty = try self.addState(.{ .transition = .epsilon });
-            var out = std.ArrayListUnmanaged(usize){};
+            var out: std.ArrayListUnmanaged(usize) = .empty;
             errdefer out.deinit(self.allocator);
             try out.append(self.allocator, empty);
             return .{ .start = empty, .out = out };
         }
 
-        var copies = std.ArrayListUnmanaged(Fragment){};
+        var copies: std.ArrayListUnmanaged(Fragment) = .empty;
         defer copies.deinit(self.allocator);
         errdefer for (copies.items) |*copy| copy.out.deinit(self.allocator);
         try copies.append(self.allocator, atom);
@@ -2080,18 +2080,18 @@ const Compiler = struct {
                 (min == 0 or index == min);
             if (optional) {
                 const input = copy.*;
-                copy.out = .{};
+                copy.out = .empty;
                 copy.* = try self.applyQuantifier(input, if (max == null) '*' else '?');
             }
         }
 
         var result = copies.items[0];
-        copies.items[0].out = .{};
+        copies.items[0].out = .empty;
         for (copies.items[1..]) |*copy| {
             self.patch(result.out, copy.start);
             result.out.deinit(self.allocator);
             result.out = copy.out;
-            copy.out = .{};
+            copy.out = .empty;
         }
         return result;
     }
@@ -2110,7 +2110,7 @@ const Compiler = struct {
     fn cloneFragment(self: *Compiler, source: Fragment) CompileError!Fragment {
         var state_map = [_]usize{std.math.maxInt(usize)} ** MAX_STATES;
         const start = try self.cloneState(source.start, &state_map);
-        var out = std.ArrayListUnmanaged(usize){};
+        var out: std.ArrayListUnmanaged(usize) = .empty;
         errdefer out.deinit(self.allocator);
         for (source.out.items) |old_state| {
             const mapped = state_map[old_state];

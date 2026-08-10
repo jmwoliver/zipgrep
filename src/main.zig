@@ -5,6 +5,7 @@ const walker = @import("walker.zig");
 const gitignore = @import("gitignore.zig");
 const output = @import("output.zig");
 const matcher = @import("matcher.zig");
+const io = std.Io.Threaded.global_single_threaded.io();
 
 pub const ColorMode = enum { auto, always, never };
 pub const HeadingMode = enum { auto, always, never };
@@ -53,19 +54,19 @@ pub const Config = struct {
     }
 };
 
-pub fn main() void {
-    const exit_code = mainResult();
+pub fn main(init: std.process.Init.Minimal) void {
+    const exit_code = mainResult(init.args);
     if (exit_code != 0) std.process.exit(exit_code);
 }
 
-fn mainResult() u8 {
+fn mainResult(process_args: std.process.Args) u8 {
     // Use page allocator backing an arena for fast bulk allocations
     // Arena is much faster than GeneralPurposeAllocator for our use case
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const config = parseArgs(allocator) catch |err| {
+    const config = parseArgs(allocator, process_args) catch |err| {
         if (err == error.HelpRequested) {
             return 0;
         }
@@ -81,15 +82,15 @@ fn mainResult() u8 {
     return if (matched) 0 else 1;
 }
 
-fn parseArgs(allocator: std.mem.Allocator) !Config {
-    var args = try std.process.argsWithAllocator(allocator);
+fn parseArgs(allocator: std.mem.Allocator, process_args: std.process.Args) !Config {
+    var args = try process_args.iterateAllocator(allocator);
     defer args.deinit();
 
     // Skip program name
     _ = args.skip();
 
     // Collect all args into a slice
-    var args_list = std.ArrayListUnmanaged([]const u8){};
+    var args_list: std.ArrayListUnmanaged([]const u8) = .empty;
     defer args_list.deinit(allocator);
 
     while (args.next()) |arg| {
@@ -102,9 +103,9 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
 /// Parse arguments from a slice of strings (testable version)
 pub fn parseArgsFromSlice(allocator: std.mem.Allocator, args: []const []const u8) !Config {
     var pattern: ?[]const u8 = null;
-    var paths = std.ArrayListUnmanaged([]const u8){};
+    var paths: std.ArrayListUnmanaged([]const u8) = .empty;
     defer paths.deinit(allocator);
-    var glob_patterns = std.ArrayListUnmanaged(GlobPattern){};
+    var glob_patterns: std.ArrayListUnmanaged(GlobPattern) = .empty;
     defer glob_patterns.deinit(allocator);
 
     var config = Config{
@@ -214,8 +215,8 @@ pub fn parseArgsFromSlice(allocator: std.mem.Allocator, args: []const []const u8
 
     if (paths.items.len == 0) {
         // Auto-detect: if stdin is piped (not TTY), read from stdin; otherwise search current directory
-        const stdin = std.fs.File.stdin();
-        if (!stdin.isTty()) {
+        const stdin = std.Io.File.stdin();
+        if (!(stdin.isTty(io) catch false)) {
             try paths.append(allocator, "-"); // stdin mode
         } else {
             try paths.append(allocator, "."); // current directory
@@ -231,7 +232,7 @@ pub fn parseArgsFromSlice(allocator: std.mem.Allocator, args: []const []const u8
     // Compute is_single_source once (avoid repeated stat calls in output formatting)
     config.is_single_source = config.paths.len == 1 and blk: {
         if (std.mem.eql(u8, config.paths[0], "-")) break :blk true;
-        const stat = std.fs.cwd().statFile(config.paths[0]) catch break :blk true;
+        const stat = std.Io.Dir.cwd().statFile(io, config.paths[0], .{}) catch break :blk true;
         break :blk stat.kind != .directory;
     };
 
@@ -290,7 +291,7 @@ fn run(allocator: std.mem.Allocator, config: Config) !bool {
     // With arena allocator, no need to free individual allocations
     // The arena handles bulk deallocation at the end
 
-    const stdout = std.fs.File.stdout();
+    const stdout = std.Io.File.stdout();
 
     // Create the pattern matcher
     var pattern_matcher = try matcher.Matcher.init(allocator, config.pattern, config.ignore_case, config.word_boundary);

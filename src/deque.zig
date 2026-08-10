@@ -1,4 +1,5 @@
 const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
 
 /// A synchronized work-stealing deque.
 ///
@@ -96,7 +97,7 @@ pub fn Deque(comptime T: type) type {
         allocator: std.mem.Allocator,
 
         /// Serializes owner and stealer operations.
-        mutex: std.Thread.Mutex,
+        mutex: std.Io.Mutex,
 
         /// Minimum buffer capacity
         const MIN_CAPACITY: usize = 64;
@@ -115,10 +116,10 @@ pub fn Deque(comptime T: type) type {
             const deque = try allocator.create(Self);
             errdefer allocator.destroy(deque);
             deque.* = .{
-                .items = .{},
+                .items = .empty,
                 .top = 0,
                 .allocator = allocator,
-                .mutex = .{},
+                .mutex = .init,
             };
             try deque.items.ensureTotalCapacity(allocator, capacity);
             return deque;
@@ -142,15 +143,15 @@ pub fn Deque(comptime T: type) type {
 
         /// Check if the deque is empty.
         pub fn isEmpty(self: *Self) bool {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
             return self.top >= self.items.items.len;
         }
 
         /// Get the current length.
         pub fn len(self: *Self) usize {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
             return self.items.items.len - self.top;
         }
     };
@@ -168,8 +169,8 @@ pub fn Worker(comptime T: type) type {
         /// Push an item to the bottom of the deque.
         /// May grow the buffer if needed.
         pub fn push(self: *Self, item: T) !void {
-            self.deque.mutex.lock();
-            defer self.deque.mutex.unlock();
+            self.deque.mutex.lockUncancelable(io);
+            defer self.deque.mutex.unlock(io);
 
             if (self.deque.top == self.deque.items.items.len) {
                 self.deque.items.clearRetainingCapacity();
@@ -186,8 +187,8 @@ pub fn Worker(comptime T: type) type {
         /// Pop an item from the bottom of the deque (LIFO).
         /// Returns null if the deque is empty.
         pub fn pop(self: *Self) ?T {
-            self.deque.mutex.lock();
-            defer self.deque.mutex.unlock();
+            self.deque.mutex.lockUncancelable(io);
+            defer self.deque.mutex.unlock(io);
 
             if (self.deque.top >= self.deque.items.items.len) return null;
             const item = self.deque.items.pop().?;
@@ -212,8 +213,8 @@ pub fn Stealer(comptime T: type) type {
 
         /// Attempt to steal an item from the top of the deque.
         pub fn steal(self: *Self) Result {
-            self.deque.mutex.lock();
-            defer self.deque.mutex.unlock();
+            self.deque.mutex.lockUncancelable(io);
+            defer self.deque.mutex.unlock(io);
 
             if (self.deque.top >= self.deque.items.items.len) return .empty;
             const item = self.deque.items.items[self.deque.top];
@@ -485,18 +486,18 @@ test "Deque stress: one producer, one stealer" {
     var received = std.AutoHashMap(usize, void).init(allocator);
     defer received.deinit();
 
-    var received_mutex = std.Thread.Mutex{};
+    var received_mutex: std.Io.Mutex = .init;
     var done = std.atomic.Value(bool).init(false);
 
     // Stealer thread
     const stealer_thread = try std.Thread.spawn(.{}, struct {
-        fn run(d: *Deque(usize), recv: *std.AutoHashMap(usize, void), mutex: *std.Thread.Mutex, done_flag: *std.atomic.Value(bool)) void {
+        fn run(d: *Deque(usize), recv: *std.AutoHashMap(usize, void), mutex: *std.Io.Mutex, done_flag: *std.atomic.Value(bool)) void {
             var s = d.stealer();
             while (!done_flag.load(.acquire) or !d.isEmpty()) {
                 switch (s.steal()) {
                     .success => |item| {
-                        mutex.lock();
-                        defer mutex.unlock();
+                        mutex.lockUncancelable(io);
+                        defer mutex.unlock(io);
                         recv.put(item, {}) catch {};
                     },
                     .empty, .retry => {},
@@ -516,8 +517,8 @@ test "Deque stress: one producer, one stealer" {
 
     // Also pop remaining items from producer side
     while (worker_handle.pop()) |item| {
-        received_mutex.lock();
-        defer received_mutex.unlock();
+        received_mutex.lockUncancelable(io);
+        defer received_mutex.unlock(io);
         try received.put(item, {});
     }
 
@@ -541,20 +542,20 @@ test "Deque stress: one producer, multiple stealers" {
     var received = std.AutoHashMap(usize, void).init(allocator);
     defer received.deinit();
 
-    var received_mutex = std.Thread.Mutex{};
+    var received_mutex: std.Io.Mutex = .init;
     var done = std.atomic.Value(bool).init(false);
 
     // Spawn stealer threads
     var stealer_threads: [num_stealers]std.Thread = undefined;
     for (0..num_stealers) |i| {
         stealer_threads[i] = try std.Thread.spawn(.{}, struct {
-            fn run(d: *Deque(usize), recv: *std.AutoHashMap(usize, void), mutex: *std.Thread.Mutex, done_flag: *std.atomic.Value(bool)) void {
+            fn run(d: *Deque(usize), recv: *std.AutoHashMap(usize, void), mutex: *std.Io.Mutex, done_flag: *std.atomic.Value(bool)) void {
                 var s = d.stealer();
                 while (!done_flag.load(.acquire) or !d.isEmpty()) {
                     switch (s.steal()) {
                         .success => |item| {
-                            mutex.lock();
-                            defer mutex.unlock();
+                            mutex.lockUncancelable(io);
+                            defer mutex.unlock(io);
                             recv.put(item, {}) catch {};
                         },
                         .empty, .retry => {},
@@ -575,8 +576,8 @@ test "Deque stress: one producer, multiple stealers" {
 
     // Pop remaining items from producer side
     while (worker_handle.pop()) |item| {
-        received_mutex.lock();
-        defer received_mutex.unlock();
+        received_mutex.lockUncancelable(io);
+        defer received_mutex.unlock(io);
         try received.put(item, {});
     }
 
@@ -602,20 +603,20 @@ test "Deque stress: producer with interleaved pop" {
     var received = std.AutoHashMap(usize, void).init(allocator);
     defer received.deinit();
 
-    var received_mutex = std.Thread.Mutex{};
+    var received_mutex: std.Io.Mutex = .init;
     var done = std.atomic.Value(bool).init(false);
 
     // Stealer threads
     var stealer_threads: [2]std.Thread = undefined;
     for (0..2) |i| {
         stealer_threads[i] = try std.Thread.spawn(.{}, struct {
-            fn run(d: *Deque(usize), recv: *std.AutoHashMap(usize, void), mutex: *std.Thread.Mutex, done_flag: *std.atomic.Value(bool)) void {
+            fn run(d: *Deque(usize), recv: *std.AutoHashMap(usize, void), mutex: *std.Io.Mutex, done_flag: *std.atomic.Value(bool)) void {
                 var s = d.stealer();
                 while (!done_flag.load(.acquire) or !d.isEmpty()) {
                     switch (s.steal()) {
                         .success => |item| {
-                            mutex.lock();
-                            defer mutex.unlock();
+                            mutex.lockUncancelable(io);
+                            defer mutex.unlock(io);
                             recv.put(item, {}) catch {};
                         },
                         .empty, .retry => {},
@@ -633,8 +634,8 @@ test "Deque stress: producer with interleaved pop" {
         // Occasionally pop from producer side
         if (i % 10 == 0) {
             if (worker_handle.pop()) |item| {
-                received_mutex.lock();
-                defer received_mutex.unlock();
+                received_mutex.lockUncancelable(io);
+                defer received_mutex.unlock(io);
                 try received.put(item, {});
             }
         }
@@ -645,8 +646,8 @@ test "Deque stress: producer with interleaved pop" {
 
     // Pop remaining items
     while (worker_handle.pop()) |item| {
-        received_mutex.lock();
-        defer received_mutex.unlock();
+        received_mutex.lockUncancelable(io);
+        defer received_mutex.unlock(io);
         try received.put(item, {});
     }
 
@@ -678,7 +679,7 @@ test "Deque stress: high contention on single item" {
                 var s = d.stealer();
                 while (!done_flag.load(.acquire)) {
                     switch (s.steal()) {
-                        .success => |_| {
+                        .success => {
                             _ = total.fetchAdd(1, .monotonic);
                         },
                         .empty, .retry => {},
@@ -687,7 +688,7 @@ test "Deque stress: high contention on single item" {
                 // Final drain
                 while (true) {
                     switch (s.steal()) {
-                        .success => |_| {
+                        .success => {
                             _ = total.fetchAdd(1, .monotonic);
                         },
                         .empty => break,
@@ -737,18 +738,18 @@ test "Deque stress: rapid grow" {
     var received = std.AutoHashMap(usize, void).init(allocator);
     defer received.deinit();
 
-    var received_mutex = std.Thread.Mutex{};
+    var received_mutex: std.Io.Mutex = .init;
     var done = std.atomic.Value(bool).init(false);
 
     // Stealer thread
     const stealer_thread = try std.Thread.spawn(.{}, struct {
-        fn run(d: *Deque(usize), recv: *std.AutoHashMap(usize, void), mutex: *std.Thread.Mutex, done_flag: *std.atomic.Value(bool)) void {
+        fn run(d: *Deque(usize), recv: *std.AutoHashMap(usize, void), mutex: *std.Io.Mutex, done_flag: *std.atomic.Value(bool)) void {
             var s = d.stealer();
             while (!done_flag.load(.acquire) or !d.isEmpty()) {
                 switch (s.steal()) {
                     .success => |item| {
-                        mutex.lock();
-                        defer mutex.unlock();
+                        mutex.lockUncancelable(io);
+                        defer mutex.unlock(io);
                         recv.put(item, {}) catch {};
                     },
                     .empty, .retry => {},
@@ -768,8 +769,8 @@ test "Deque stress: rapid grow" {
 
     // Pop remaining
     while (worker_handle.pop()) |item| {
-        received_mutex.lock();
-        defer received_mutex.unlock();
+        received_mutex.lockUncancelable(io);
+        defer received_mutex.unlock(io);
         try received.put(item, {});
     }
 
